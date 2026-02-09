@@ -1,7 +1,7 @@
 # requirements.txt - OSINT Agent Completo con Menu Regioni
 streamlit==1.38.0
 pandas==2.2.2
-plotly==5.24.1
+plotly==5.22.0
 streamlit-aggrid==1.1.0
 folium==0.20.0
 streamlit-folium==0.17.0
