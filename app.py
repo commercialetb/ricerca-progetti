@@ -5,6 +5,21 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
+import sys, os
+import streamlit as st
+
+st.write("Python:", sys.version)
+st.write("CWD:", os.getcwd())
+st.write("Files in CWD:", os.listdir("."))
+
+try:
+    import plotly
+    st.write("plotly version:", plotly.__version__)
+except Exception as e:
+    st.error(f"plotly import failed: {type(e).__name__}: {e}")
+    st.stop()
+
+import plotly.express as px
 
 from ai_enrichment import ai_enrich_contacts
 from osint_core import run_scraping
