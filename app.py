@@ -13,6 +13,13 @@ from io import BytesIO
 import re
 import sys
 
+# --- AGGIUNGI QUESTI IMPORT ---
+from osint_agent_antibot_v3_2 import CATEGORIES
+from osint_core import run_scraping
+from ai_enrichment import ai_enrich_contacts
+from utils import create_excel_4sheets, generate_outreach_templates
+# ------------------------------
+
 # Integra il TUO scraper [file:1]
 sys.path.append(".")
 from osint_agent_antibot_v3_2 import BrowserPool, SeleniumCrawler, CATEGORIES  # [file:1]
