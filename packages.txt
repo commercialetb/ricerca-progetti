@@ -1,4 +1,2 @@
 poppler-utils
-tesseract-ocr
-chromium
-chromium-driver
+
