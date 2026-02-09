@@ -1,25 +1,15 @@
-# requirements.txt - OSINT Agent Completo con Menu Regioni
 streamlit==1.38.0
 pandas==2.2.2
-plotly==5.22.0
-streamlit-aggrid==1.1.0
-folium==0.20.0
-streamlit-folium==0.17.0
-selenium==4.25.0
+numpy==2.1.1
+requests==2.32.3
+pypdf==4.3.1
+openpyxl==3.1.2
+python-dotenv==1.0.1
+dnspython==2.6.1
 beautifulsoup4==4.12.3
 lxml==5.3.0
-openpyxl==3.1.2
+plotly==5.22.0
 geopy==2.4.1
-pypdf==4.3.1
-requests==2.32.3
-anthropic==0.34.2          # Claude AI
-python-dotenv==1.0.1
-numpy==2.1.1
-dnspython==2.6.1
-
-# Dal tuo scraper [file:1]
-pytesseract==0.3.13        # OCR (sudo apt install tesseract-ocr)
-pdf2image==1.17.0          # OCR PDF
-Pillow==10.4.0
-sentence-transformers==3.1.1  # Semantic (opzionale)
-spacy==3.7.6               # NER (opzionale)
+streamlit-folium==0.17.0
+folium==0.20.0
+anthropic==0.34.2
