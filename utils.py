@@ -1,164 +1,104 @@
-# utils.py
+# utils.py - helpers (safe, no heavy imports)
 from __future__ import annotations
 
 import re
+import io
 from io import BytesIO
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 
+TITOLI_PATTERN = re.compile(r"\b(arch\.?|ing\.?|dott\.?|prof\.?|studio)\b\s*", re.IGNORECASE)
 
 def normalize_progettista(nome_raw: str) -> str:
-    nome_raw = (nome_raw or "").strip()
+    """Normalizza: 'Arch. Rossi Mario' -> 'ROSSI MARIO' (best-effort)."""
     if not nome_raw:
         return "NON TROVATO"
+    s = TITOLI_PATTERN.sub("", str(nome_raw)).strip()
+    if not s:
+        return "NON TROVATO"
+    parts = re.split(r"\s+", s.upper())
+    if len(parts) >= 2:
+        return f"{parts[-2]} {parts[-1]}"
+    return parts[0]
 
-    s = nome_raw.lower()
+def lead_segment(lead_score: float) -> str:
+    if lead_score >= 8.5:
+        return "A"
+    if lead_score >= 7.0:
+        return "B"
+    if lead_score >= 5.0:
+        return "C"
+    return "D"
 
-    # rimuovi titoli comuni
-    s = re.sub(r"\b(arch\.?|ing\.?|dott\.?|prof\.?|geom\.?|studio)\b", " ", s, flags=re.I)
-    s = re.sub(r"[^a-zàèéìòùA-ZÀÈÉÌÒÙ'\s\-]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-
-    parts = [p for p in re.split(r"[ \-]+", s) if p]
-    if len(parts) == 1:
-        return parts[0].upper()
-
-    # euristica: ultimo token come nome, primo come cognome (meglio di nulla)
-    # se già in formato COGNOME NOME, rimane comunque coerente
-    cognome = parts[0].upper()
-    nome = " ".join(parts[1:]).upper()
-    return f"{cognome} {nome}".strip()
-
-
-def _df_from_projects(projects: List[Dict]) -> pd.DataFrame:
-    if not projects:
-        return pd.DataFrame()
-    df = pd.DataFrame(projects)
-    wanted = [
-        "progettista_norm",
-        "progettista_raw",
-        "email",
-        "telefono",
-        "linkedin",
-        "validation_score",
-        "lead_quality_score",
-        "comune",
-        "provincia",
-        "regione",
-        "data_delibera",
-        "importo",
-        "cup_cig",
-        "pdf_source",
-        "portal_url",
-    ]
-    cols = [c for c in wanted if c in df.columns] + [c for c in df.columns if c not in wanted]
-    return df[cols]
-
-
-def create_excel_4sheets(projects: List[Dict]) -> bytes:
-    """Excel 4 sheet: CONTACT_LIST, PROJECTS_BY_DESIGNER, QUALITY_METRICS, OUTREACH_SEGMENTS"""
-    df = _df_from_projects(projects)
-
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    # CONTACT_LIST
-    ws = wb.create_sheet("CONTACT_LIST")
-    contact_cols = [c for c in ["progettista_norm", "email", "telefono", "linkedin", "validation_score", "regione", "comune", "pdf_source"] if c in df.columns]
-    df_contact = df[contact_cols].copy() if not df.empty else pd.DataFrame(columns=contact_cols)
-    for r in dataframe_to_rows(df_contact, index=False, header=True):
-        ws.append(r)
-
-    # PROJECTS_BY_DESIGNER
-    ws = wb.create_sheet("PROJECTS_BY_DESIGNER")
-    if not df.empty and "progettista_norm" in df.columns:
-        grouped = df.groupby("progettista_norm").size().reset_index(name="n_progetti").sort_values("n_progetti", ascending=False)
-    else:
-        grouped = pd.DataFrame(columns=["progettista_norm", "n_progetti"])
-    for r in dataframe_to_rows(grouped, index=False, header=True):
-        ws.append(r)
-
-    # QUALITY_METRICS
-    ws = wb.create_sheet("QUALITY_METRICS")
-    qm_cols = [c for c in ["progettista_norm", "validation_score", "lead_quality_score"] if c in df.columns]
-    df_qm = df[qm_cols].copy() if not df.empty else pd.DataFrame(columns=qm_cols)
-    for r in dataframe_to_rows(df_qm, index=False, header=True):
-        ws.append(r)
-
-    # OUTREACH_SEGMENTS
-    ws = wb.create_sheet("OUTREACH_SEGMENTS")
-    seg = segment_leads(df)
-    for r in dataframe_to_rows(seg, index=False, header=True):
-        ws.append(r)
-
-    bio = BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
-
-
-def segment_leads(df: pd.DataFrame) -> pd.DataFrame:
+def create_csv_segments(leads: List[Dict]) -> Tuple[str, Dict[str, str]]:
+    """Return combined CSV and per-segment CSVs as strings."""
+    df = pd.DataFrame(leads).copy()
     if df.empty:
-        return pd.DataFrame(columns=["progettista_norm", "segment", "lead_quality_score", "email", "telefono", "regione", "comune", "pdf_source"])
+        return "", {"A": "", "B": "", "C": "", "D": ""}
 
-    out = df.copy()
-    if "lead_quality_score" not in out.columns:
-        out["lead_quality_score"] = 0.0
+    if "lead_quality_score" in df.columns and "LEAD_SCORE" not in df.columns:
+        df["LEAD_SCORE"] = pd.to_numeric(df["lead_quality_score"], errors="coerce")
+    if "LEAD_SCORE" not in df.columns:
+        df["LEAD_SCORE"] = 0.0
 
-    def seg(x: float) -> str:
-        try:
-            x = float(x)
-        except Exception:
-            x = 0.0
-        if x >= 8.5:
-            return "A"
-        if x >= 7.0:
-            return "B"
-        if x >= 5.0:
-            return "C"
-        return "D"
+    df["SEGMENT"] = df["LEAD_SCORE"].fillna(0).apply(lead_segment)
 
-    out["segment"] = out["lead_quality_score"].apply(seg)
+    combined = df.to_csv(index=False)
+    per = {}
+    for seg in ["A", "B", "C", "D"]:
+        per[seg] = df[df["SEGMENT"] == seg].to_csv(index=False)
+    return combined, per
 
-    cols = [c for c in ["progettista_norm", "segment", "lead_quality_score", "email", "telefono", "regione", "comune", "pdf_source"] if c in out.columns]
-    return out[cols].sort_values(["segment", "lead_quality_score"], ascending=[True, False])
+def create_excel_4sheets(leads: List[Dict]) -> bytes:
+    """Excel 4-sheet: CONTACT_LIST, PROJECTS_BY_DESIGNER, QUALITY_METRICS, OUTREACH_SEGMENTS"""
+    wb = Workbook()
+    df = pd.DataFrame(leads)
 
+    # 1) CONTACT_LIST
+    ws = wb.active
+    ws.title = "CONTACT_LIST"
+    cols = [c for c in ["progettista_norm", "email", "telefono", "validation_score", "linkedin"] if c in df.columns]
+    if not cols:
+        cols = list(df.columns)[:10]
+    for r in dataframe_to_rows(df[cols], index=False, header=True):
+        ws.append(r)
 
-def create_csv_segments(projects: List[Dict]) -> bytes:
-    df = _df_from_projects(projects)
-    seg = segment_leads(df)
-    return seg.to_csv(index=False).encode("utf-8")
+    # 2) PROJECTS_BY_DESIGNER
+    ws2 = wb.create_sheet("PROJECTS_BY_DESIGNER")
+    proj_cols = [c for c in ["progettista_norm", "comune", "provincia", "regione", "cup_cig", "importo", "data_delibera", "pdf_source", "portal_url"] if c in df.columns]
+    if not proj_cols:
+        proj_cols = list(df.columns)[:10]
+    for r in dataframe_to_rows(df[proj_cols], index=False, header=True):
+        ws2.append(r)
 
+    # 3) QUALITY_METRICS
+    ws3 = wb.create_sheet("QUALITY_METRICS")
+    qm = df.copy()
+    if "validation_score" not in qm.columns:
+        qm["validation_score"] = None
+    if "lead_quality_score" in qm.columns and "LEAD_SCORE" not in qm.columns:
+        qm["LEAD_SCORE"] = qm["lead_quality_score"]
+    if "LEAD_SCORE" not in qm.columns:
+        qm["LEAD_SCORE"] = None
+    metric_cols = [c for c in ["progettista_norm", "validation_score", "LEAD_SCORE", "fonti", "error_ai"] if c in qm.columns]
+    for r in dataframe_to_rows(qm[metric_cols], index=False, header=True):
+        ws3.append(r)
 
-def generate_outreach_templates(top_leads: List[Dict]) -> str:
-    lines = []
-    lines.append("EMAIL 1\n------")
-    lines.append("Oggetto: Riguardo al progetto [PROGETTO] a [CITTÀ]")
-    lines.append(
-        "Ciao [NOME],\n"
-        "ho visto l’intervento [PROGETTO] a [CITTÀ] ([DATA]). "
-        "Stiamo lavorando su [SOLUZIONE] che può aiutare in [BENEFIT]. "
-        "Ti va una call di 15 minuti questa settimana?\n"
-        "Grazie,\n[IL_TUO_NOME]\n"
+    # 4) OUTREACH_SEGMENTS
+    ws4 = wb.create_sheet("OUTREACH_SEGMENTS")
+    _combined, per = create_csv_segments(leads)
+    seg_df = pd.DataFrame(
+        [
+            {"SEGMENT": k, "COUNT": len(pd.read_csv(io.StringIO(v))) if v.strip() else 0}
+            for k, v in per.items()
+        ]
     )
-    lines.append("\nEMAIL 2\n------")
-    lines.append("Oggetto: Progetti in ambito [CATEGORIA] in [REGIONE]")
-    lines.append(
-        "Ciao [NOME],\n"
-        "seguo diversi interventi in ambito [CATEGORIA] in [REGIONE]. "
-        "Ho notato che hai seguito [N] progetti recenti. "
-        "Possiamo sentirci per capire se [SOLUZIONE] è utile anche per i tuoi prossimi lavori?\n"
-        "Un saluto,\n[IL_TUO_NOME]\n"
-    )
+    for r in dataframe_to_rows(seg_df, index=False, header=True):
+        ws4.append(r)
 
-    if top_leads:
-        lines.append("\nESEMPI PERSONALIZZATI (TOP)\n--------------------------")
-        for p in top_leads[:10]:
-            lines.append(
-                f"- {p.get('progettista_norm','NON TROVATO')} | {p.get('comune','')} | "
-                f"{p.get('data_delibera','')} | fonte: {p.get('pdf_source','')}"
-            )
-
-    return "\n".join(lines)
+    out = BytesIO()
+    wb.save(out)
+    return out.getvalue()
