@@ -1,5 +1,4 @@
-# (opzionale) lascia vuoto se non usi OCR/Selenium.
-# poppler-utils
-# tesseract-ocr
-# chromium
-# chromium-driver
+poppler-utils
+tesseract-ocr
+chromium
+chromium-driver
