@@ -1,122 +1,147 @@
-# ai_enrichment.py - enrichment contatti (robusto + supporto Groq)
+# ai_enrichment.py - Arricchimento contatti (opzionale)
 from __future__ import annotations
 
 import json
-from typing import List, Dict, Any
+from typing import Dict, List, Optional
 
 from utils import normalize_progettista
 
 
-def _safe_float(x, default=0.0) -> float:
+def _safe_float(x, default: Optional[float] = None) -> Optional[float]:
     try:
         return float(x)
     except Exception:
-        return float(default)
+        return default
 
 
-def _basic_enrich(project: Dict[str, Any]) -> Dict[str, Any]:
-    """Fallback senza chiamate API: normalizzazione + score a 0."""
-    project["progettista_norm"] = normalize_progettista(project.get("progettista_raw", "") or "")
-    project.setdefault("email", "non trovato")
-    project.setdefault("telefono", "non trovato")
-    project.setdefault("linkedin", "")
-    project.setdefault("validation_score", 0)
-    project.setdefault("lead_quality_score", 0.0)
-    project.setdefault("fonti", [])
-    project.setdefault("error_ai", "API key assente o provider non configurato")
-    return project
-
-
-def ai_enrich_contacts(projects: List[Dict], api_key: str, provider: str) -> List[Dict]:
-    """Arricchisce ogni progetto con contatti verificati.
-    Se api_key è vuota, usa fallback basic (no crash).
+def ai_enrich_contacts(projects: List[Dict], api_key: str | None = None, provider: str = "anthropic") -> List[Dict]:
+    """Arricchisce i progetti con contatti.
+    - Se manca API key o provider non è installato: NON fallisce, mette 'non trovato'.
+    - Non inventa mai email/telefono.
     """
-    provider = (provider or "").strip()
+    provider = (provider or "anthropic").lower().strip()
+    api_key = (api_key or "").strip()
 
     if not api_key:
-        return [_basic_enrich(dict(p)) for p in projects]
+        out: List[Dict] = []
+        for p in projects or []:
+            q = dict(p)
+            q.setdefault("progettista_norm", normalize_progettista(q.get("progettista_raw", "")))
+            q.setdefault("email", "non trovato")
+            q.setdefault("telefono", "non trovato")
+            q.setdefault("linkedin", "non trovato")
+            q.setdefault("validation_score", 0)
+            q.setdefault("fonti", [])
+            q.setdefault("lead_quality_score", 0)
+            q["ai_note"] = "API key non impostata: enrichment saltato"
+            out.append(q)
+        return out
+
+    client = None
+    if provider == "anthropic":
+        try:
+            import anthropic  # type: ignore
+            client = anthropic.Anthropic(api_key=api_key)
+        except Exception as e:
+            client = None
+            provider_err = f"anthropic non disponibile: {e}"
+    elif provider == "groq":
+        try:
+            from groq import Groq  # type: ignore
+            client = Groq(api_key=api_key)
+        except Exception as e:
+            client = None
+            provider_err = f"groq non disponibile: {e}"
+    else:
+        client = None
+        provider_err = f"provider sconosciuto: {provider}"
+
+    if client is None:
+        out: List[Dict] = []
+        for p in projects or []:
+            q = dict(p)
+            q.setdefault("progettista_norm", normalize_progettista(q.get("progettista_raw", "")))
+            q.setdefault("email", "non trovato")
+            q.setdefault("telefono", "non trovato")
+            q.setdefault("linkedin", "non trovato")
+            q.setdefault("validation_score", 0)
+            q.setdefault("fonti", [])
+            q.setdefault("lead_quality_score", 0)
+            q["ai_note"] = provider_err
+            out.append(q)
+        return out
 
     enriched: List[Dict] = []
+    for project in projects or []:
+        base = dict(project)
+        base.setdefault("progettista_norm", normalize_progettista(base.get("progettista_raw", "")))
 
-    if provider == "Claude (Anthropic)":
-        import anthropic  # type: ignore
-        client = anthropic.Anthropic(api_key=api_key)
+        prompt = (
+            "Sei un assistente OSINT. NON inventare mai email o telefoni. "
+            "Se non trovi un dato, rispondi con 'non trovato'.\n\n"
+            f"Progettista (raw): {base.get('progettista_raw','')}\n"
+            f"Comune: {base.get('comune','')}\n"
+            f"Regione: {base.get('regione','')}\n"
+            f"Fonte PDF: {base.get('pdf_source','')}\n\n"
+            "Trova (se esistono) email, telefono, LinkedIn del progettista, citando fonti. "
+            "Rispondi SOLO con JSON valido nel seguente schema:\n"
+            "{"
+            "\"progettista_norm\":\"COGNOME NOME\","
+            "\"email\":\"email@dominio.it o non trovato\","
+            "\"telefono\":\"+39... o non trovato\","
+            "\"linkedin\":\"url o non trovato\","
+            "\"validation_score\":0,"
+            "\"fonti\":[\"...\"],"
+            "\"lead_quality_score\":0"
+            "}"
+        )
 
-        def call_llm(prompt: str) -> str:
-            resp = client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=800,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return resp.content[0].text
-
-    elif provider == "Groq":
-        from groq import Groq  # type: ignore
-        client = Groq(api_key=api_key)
-
-        def call_llm(prompt: str) -> str:
-            resp = client.chat.completions.create(
-                model="llama-3.1-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=900,
-            )
-            return resp.choices[0].message.content or ""
-
-    else:
-        return [_basic_enrich(dict(p)) for p in projects]
-
-    for project in projects:
-        p = dict(project)
-
-        prompt = f"""Per il progettista "{p.get('progettista_raw', 'non trovato')}" del progetto a {p.get('comune', '')}:
-
-RICERCA CONTATTI (7 livelli priorità):
-1. Delibere pubbliche (email/tel diretti)
-2. Ordini professionali
-3. ANAC anticorruzione.it
-4. Sito studio professionale
-5. LinkedIn
-6. Google "nome + email"
-7. Ricerca inversa
-
-IMPORTANTISSIMO:
-- Restituisci SOLO JSON valido (senza markdown).
-- Se un dato non è trovato usa "non trovato".
-
-JSON atteso:
-{{
-  "progettista_norm": "COGNOME NOME",
-  "email": "non trovato",
-  "telefono": "non trovato",
-  "linkedin": "",
-  "validation_score": 0,
-  "fonti": [],
-  "lead_quality_score": 0.0
-}}
-"""
-
+        raw_text = None
         try:
-            raw = call_llm(prompt).strip()
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                raw = raw[start : end + 1]
+            if provider == "anthropic":
+                resp = client.messages.create(
+                    model="claude-3-5-sonnet-20241022",
+                    max_tokens=700,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw_text = resp.content[0].text
+            else:
+                resp = client.chat.completions.create(
+                    model="llama-3.1-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                )
+                raw_text = resp.choices[0].message.content
 
-            contact_data = json.loads(raw)
-
-            p.update(contact_data)
-
-            if not p.get("progettista_norm") or p["progettista_norm"] == "non trovato":
-                p["progettista_norm"] = normalize_progettista(p.get("progettista_raw", ""))
-
-            p["validation_score"] = int(_safe_float(p.get("validation_score", 0), 0))
-            p["lead_quality_score"] = _safe_float(p.get("lead_quality_score", 0.0), 0.0)
-
-            enriched.append(p)
+            data = json.loads(raw_text)
         except Exception as e:
-            p = _basic_enrich(p)
-            p["error_ai"] = f"AI error: {type(e).__name__}"
-            enriched.append(p)
+            base["error_ai"] = f"Parsing/Call fallita: {e}"
+            base.setdefault("email", "non trovato")
+            base.setdefault("telefono", "non trovato")
+            base.setdefault("linkedin", "non trovato")
+            base.setdefault("validation_score", 0)
+            base.setdefault("fonti", [])
+            base.setdefault("lead_quality_score", 0)
+            enriched.append(base)
+            continue
+
+        base["progettista_norm"] = (data.get("progettista_norm") or base["progettista_norm"]).strip() or base["progettista_norm"]
+        base["email"] = (data.get("email") or "non trovato").strip() or "non trovato"
+        base["telefono"] = (data.get("telefono") or "non trovato").strip() or "non trovato"
+        base["linkedin"] = (data.get("linkedin") or "non trovato").strip() or "non trovato"
+
+        vs = data.get("validation_score")
+        try:
+            base["validation_score"] = int(float(vs)) if vs is not None else 0
+        except Exception:
+            base["validation_score"] = 0
+
+        lqs = _safe_float(data.get("lead_quality_score"), 0.0) or 0.0
+        base["lead_quality_score"] = max(0.0, min(10.0, float(lqs)))
+
+        fonti = data.get("fonti")
+        base["fonti"] = [str(x) for x in fonti][:10] if isinstance(fonti, list) else []
+
+        enriched.append(base)
 
     return enriched
