@@ -17,7 +17,7 @@ dnspython==2.6.1
 # groq==0.11.0
 
 # Optional heavy deps (NON consigliate su Cloud se non necessarie)
-# selenium==4.25.0
+selenium==4.25.0
 # pdf2image==1.17.0
 # pytesseract==0.3.13
 # Pillow==10.4.0
