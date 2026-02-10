@@ -1,104 +1,96 @@
-# utils.py - helpers (safe, no heavy imports)
-from __future__ import annotations
-
-import re
 import io
-from io import BytesIO
-from typing import Dict, List, Tuple
+import re
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
+import requests
+from pypdf import PdfReader
 
-TITOLI_PATTERN = re.compile(r"\b(arch\.?|ing\.?|dott\.?|prof\.?|studio)\b\s*", re.IGNORECASE)
+def safe_to_datetime(x) -> Optional[pd.Timestamp]:
+    if x is None or x == "":
+        return None
+    try:
+        return pd.to_datetime(x, dayfirst=True, errors="coerce")
+    except Exception:
+        return None
 
-def normalize_progettista(nome_raw: str) -> str:
-    """Normalizza: 'Arch. Rossi Mario' -> 'ROSSI MARIO' (best-effort)."""
-    if not nome_raw:
-        return "NON TROVATO"
-    s = TITOLI_PATTERN.sub("", str(nome_raw)).strip()
-    if not s:
-        return "NON TROVATO"
-    parts = re.split(r"\s+", s.upper())
-    if len(parts) >= 2:
-        return f"{parts[-2]} {parts[-1]}"
-    return parts[0]
+def load_master_sa(path: str) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        p2 = Path.cwd() / path
+        if p2.exists():
+            p = p2
+        else:
+            raise FileNotFoundError(f"File non trovato: {path} (cwd={Path.cwd()})")
+    return pd.read_csv(p)
 
-def lead_segment(lead_score: float) -> str:
-    if lead_score >= 8.5:
-        return "A"
-    if lead_score >= 7.0:
-        return "B"
-    if lead_score >= 5.0:
-        return "C"
-    return "D"
+def filter_master_sa(df: pd.DataFrame, regioni, enti, region_col=None, ente_col=None) -> pd.DataFrame:
+    out = df.copy()
+    if region_col and regioni:
+        out = out[out[region_col].isin(regioni)]
+    if ente_col and enti:
+        out = out[out[ente_col].isin(enti)]
+    return out
 
-def create_csv_segments(leads: List[Dict]) -> Tuple[str, Dict[str, str]]:
-    """Return combined CSV and per-segment CSVs as strings."""
-    df = pd.DataFrame(leads).copy()
-    if df.empty:
-        return "", {"A": "", "B": "", "C": "", "D": ""}
+def extract_pdf_text_basic(pdf_url: str, timeout_s: int = 12, max_pages: int = 5) -> str:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; RicercaProgetti/1.0)"}
+    r = requests.get(pdf_url, headers=headers, timeout=timeout_s)
+    r.raise_for_status()
+    data = io.BytesIO(r.content)
+    reader = PdfReader(data)
+    txt = []
+    for page in reader.pages[:max_pages]:
+        try:
+            txt.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return "\n".join(txt)
 
-    if "lead_quality_score" in df.columns and "LEAD_SCORE" not in df.columns:
-        df["LEAD_SCORE"] = pd.to_numeric(df["lead_quality_score"], errors="coerce")
-    if "LEAD_SCORE" not in df.columns:
-        df["LEAD_SCORE"] = 0.0
+def guess_date_in_text(text: str) -> str:
+    m = re.search(r"\b([0-3]\d)[/\.\-]([01]\d)[/\.\-]((?:19|20)\d{2})\b", text)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+    m2 = re.search(r"\b((?:19|20)\d{2})-([01]\d)-([0-3]\d)\b", text)
+    if m2:
+        return f"{m2.group(3)}/{m2.group(2)}/{m2.group(1)}"
+    return ""
 
-    df["SEGMENT"] = df["LEAD_SCORE"].fillna(0).apply(lead_segment)
+def df_to_excel_bytes(results_df: pd.DataFrame, segments_df: pd.DataFrame, meta: Dict[str, Any]) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        results_df.to_excel(writer, sheet_name="RESULTS", index=False)
+        segments_df.to_excel(writer, sheet_name="SEGMENTS", index=False)
+        pd.DataFrame([meta]).to_excel(writer, sheet_name="META", index=False)
+    return output.getvalue()
 
-    combined = df.to_csv(index=False)
-    per = {}
-    for seg in ["A", "B", "C", "D"]:
-        per[seg] = df[df["SEGMENT"] == seg].to_csv(index=False)
-    return combined, per
+def segment_leads_placeholder(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
 
-def create_excel_4sheets(leads: List[Dict]) -> bytes:
-    """Excel 4-sheet: CONTACT_LIST, PROJECTS_BY_DESIGNER, QUALITY_METRICS, OUTREACH_SEGMENTS"""
-    wb = Workbook()
-    df = pd.DataFrame(leads)
+    def score_row(r):
+        s = 0
+        if str(r.get("email", "")).strip():
+            s += 4
+        if str(r.get("phone", "")).strip():
+            s += 2
+        if str(r.get("cup", "")).strip():
+            s += 2
+        if str(r.get("cig", "")).strip():
+            s += 2
+        return s
 
-    # 1) CONTACT_LIST
-    ws = wb.active
-    ws.title = "CONTACT_LIST"
-    cols = [c for c in ["progettista_norm", "email", "telefono", "validation_score", "linkedin"] if c in df.columns]
-    if not cols:
-        cols = list(df.columns)[:10]
-    for r in dataframe_to_rows(df[cols], index=False, header=True):
-        ws.append(r)
+    out["lead_score_0_10"] = out.apply(score_row, axis=1)
 
-    # 2) PROJECTS_BY_DESIGNER
-    ws2 = wb.create_sheet("PROJECTS_BY_DESIGNER")
-    proj_cols = [c for c in ["progettista_norm", "comune", "provincia", "regione", "cup_cig", "importo", "data_delibera", "pdf_source", "portal_url"] if c in df.columns]
-    if not proj_cols:
-        proj_cols = list(df.columns)[:10]
-    for r in dataframe_to_rows(df[proj_cols], index=False, header=True):
-        ws2.append(r)
+    def seg(x):
+        if x >= 8:
+            return "A"
+        if x >= 6:
+            return "B"
+        if x >= 4:
+            return "C"
+        return "D"
 
-    # 3) QUALITY_METRICS
-    ws3 = wb.create_sheet("QUALITY_METRICS")
-    qm = df.copy()
-    if "validation_score" not in qm.columns:
-        qm["validation_score"] = None
-    if "lead_quality_score" in qm.columns and "LEAD_SCORE" not in qm.columns:
-        qm["LEAD_SCORE"] = qm["lead_quality_score"]
-    if "LEAD_SCORE" not in qm.columns:
-        qm["LEAD_SCORE"] = None
-    metric_cols = [c for c in ["progettista_norm", "validation_score", "LEAD_SCORE", "fonti", "error_ai"] if c in qm.columns]
-    for r in dataframe_to_rows(qm[metric_cols], index=False, header=True):
-        ws3.append(r)
-
-    # 4) OUTREACH_SEGMENTS
-    ws4 = wb.create_sheet("OUTREACH_SEGMENTS")
-    _combined, per = create_csv_segments(leads)
-    seg_df = pd.DataFrame(
-        [
-            {"SEGMENT": k, "COUNT": len(pd.read_csv(io.StringIO(v))) if v.strip() else 0}
-            for k, v in per.items()
-        ]
-    )
-    for r in dataframe_to_rows(seg_df, index=False, header=True):
-        ws4.append(r)
-
-    out = BytesIO()
-    wb.save(out)
-    return out.getvalue()
+    out["segment"] = out["lead_score_0_10"].apply(seg)
+    cols = ["region", "ente", "portal_url", "page_url", "pdf_url", "published_date", "email", "phone", "lead_score_0_10", "segment"]
+    cols = [c for c in cols if c in out.columns]
+    return out[cols].sort_values(["segment", "lead_score_0_10"], ascending=[True, False])
