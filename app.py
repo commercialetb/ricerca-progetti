@@ -1,338 +1,242 @@
-import time
+import os
+from datetime import date
+
 import pandas as pd
 import streamlit as st
 
-from osint_core import run_osint_search, default_keywords_by_category
-from utils import (
-    load_master_sa,
-    filter_master_sa,
-    df_to_excel_bytes,
-    segment_leads_placeholder,
-)
+from osint_core import search_portals_light
+from utils import dataframe_to_csv_bytes, load_csv_robusto
 
-APP_TITLE = "Ricerca Progetti Italia — Streamlit (Anti-loop)"
-st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-# ----------------------------
-# Session state defaults
-# ----------------------------
-if "master_df" not in st.session_state:
-    st.session_state.master_df = None
-if "results_df" not in st.session_state:
-    st.session_state.results_df = pd.DataFrame()
-if "log_lines" not in st.session_state:
-    st.session_state.log_lines = []
-if "last_run_meta" not in st.session_state:
-    st.session_state.last_run_meta = {}
-if "config" not in st.session_state:
-    st.session_state.config = None
+APP_TITLE = "🧠 Ricerca Progetti – OSINT Agent (Streamlit)"
+DEFAULT_MASTER_CSV = "MASTER_SA_gare_links_NORMALIZED.csv"  # deve essere presente nel repo
 
-def log(msg: str):
-    ts = time.strftime("%H:%M:%S")
-    st.session_state.log_lines.append(f"[{ts}] {msg}")
 
-# ----------------------------
-# Sidebar: menu
-# ----------------------------
-st.sidebar.title("Menu")
-section = st.sidebar.radio(
-    "Sezione",
-    ["1) Dati portali", "2) Configura ricerca", "3) Esegui", "4) Risultati & Export", "Impostazioni"],
-)
-
-st.title(APP_TITLE)
-st.caption("Boot veloce: niente scraping / OCR / Selenium all'avvio. Tutto parte solo quando premi **Avvia ricerca**.")
-
-# ----------------------------
-# Frontend toggles (feature flags)
-# ----------------------------
-with st.sidebar.expander("Feature (toggle)", expanded=False):
-    enable_plotly = st.toggle("Abilita grafici Plotly (se installato)", value=False)
-    enable_ai = st.toggle("Abilita AI enrichment (se installato/configurato)", value=False)
-    enable_selenium = st.toggle("Abilita Selenium (richiede chromium + driver)", value=False)
-    enable_ocr = st.toggle("Abilita OCR PDF (richiede poppler + tesseract)", value=False)
-
-st.session_state["features"] = {
-    "plotly": enable_plotly,
-    "ai": enable_ai,
-    "selenium": enable_selenium,
-    "ocr": enable_ocr,
-}
-
-# ----------------------------
-# 1) Load portals (MASTER_SA)
-# ----------------------------
-if section == "1) Dati portali":
-    st.subheader("1) Carica portali (MASTER_SA)")
-    st.write("Puoi usare il CSV nel repo (consigliato) oppure caricarne uno manualmente.")
-
-    col1, col2 = st.columns([1, 1])
-
-    with col1:
-        default_path = st.text_input(
-            "Percorso CSV MASTER_SA nel repo",
-            value="MASTER_SA_gare_links_NORMALIZED.csv",
-            help="Metti il file nella root del repo. In alternativa usa upload qui sotto."
-        )
-        if st.button("Carica dal repo", type="primary"):
-            try:
-                df = load_master_sa(default_path)
-                st.session_state.master_df = df
-                log(f"MASTER_SA caricato dal repo: {default_path} ({len(df)} righe)")
-                st.success(f"Caricato: {len(df)} righe")
-            except Exception as e:
-                st.error(f"Errore caricamento dal repo: {e}")
-                log(f"ERRORE load_master_sa: {e}")
-
-    with col2:
-        up = st.file_uploader("Oppure carica CSV MASTER_SA", type=["csv"])
-        if up is not None and st.button("Usa CSV caricato"):
-            try:
-                df = pd.read_csv(up)
-                st.session_state.master_df = df
-                log(f"MASTER_SA caricato da upload ({len(df)} righe)")
-                st.success(f"Caricato: {len(df)} righe")
-            except Exception as e:
-                st.error(f"Errore lettura CSV: {e}")
-                log(f"ERRORE read_csv(upload): {e}")
-
-    if st.session_state.master_df is not None:
-        st.divider()
-        st.subheader("Anteprima e filtri rapidi")
-
-        df = st.session_state.master_df.copy()
-        cols = {c.lower(): c for c in df.columns}
-        region_col = cols.get("regione") or cols.get("region")
-        ente_col = cols.get("ente") or cols.get("amministrazione") or cols.get("stazione_appaltante")
-        url_col = cols.get("url") or cols.get("link") or cols.get("sito") or cols.get("domain")
-
-        c1, c2, c3 = st.columns([1, 1, 1])
-        with c1:
-            regioni = sorted(df[region_col].dropna().unique().tolist()) if region_col else []
-            sel_reg = st.multiselect("Regioni", regioni, default=[])
-        with c2:
-            enti = sorted(df[ente_col].dropna().unique().tolist()) if ente_col else []
-            sel_ente = st.multiselect("Enti", enti, default=[])
-        with c3:
-            st.write("Colonne rilevate")
-            st.json({"regione": region_col, "ente": ente_col, "url": url_col})
-
-        df_f = filter_master_sa(df, sel_reg, sel_ente, region_col=region_col, ente_col=ente_col)
-        st.write(f"Righe dopo filtro: **{len(df_f)}**")
-        st.dataframe(df_f.head(200), use_container_width=True)
-
-# ----------------------------
-# 2) Configure search
-# ----------------------------
-elif section == "2) Configura ricerca":
-    st.subheader("2) Configura ricerca")
-
-    master = st.session_state.master_df
-    if master is None:
-        st.warning("Prima carica il MASTER_SA in **1) Dati portali**.")
-        st.stop()
-
-    cols = {c.lower(): c for c in master.columns}
-    region_col = cols.get("regione") or cols.get("region")
-    ente_col = cols.get("ente") or cols.get("amministrazione") or cols.get("stazione_appaltante")
-    url_col = cols.get("url") or cols.get("link") or cols.get("sito") or cols.get("domain")
-
-    st.markdown("### Target (filtri portali)")
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        regioni = sorted(master[region_col].dropna().unique().tolist()) if region_col else []
-        sel_reg = st.multiselect("Regioni (opzionale)", regioni, default=[])
-    with c2:
-        enti = sorted(master[ente_col].dropna().unique().tolist()) if ente_col else []
-        sel_ente = st.multiselect("Enti (opzionale)", enti, default=[])
-
-    st.markdown("### Periodo atti (obbligatorio)")
-    c3, c4 = st.columns([1, 1])
-    with c3:
-        date_start = st.date_input("Data inizio", value=pd.to_datetime("2025-07-01").date())
-    with c4:
-        date_end = st.date_input("Data fine", value=pd.to_datetime("2026-01-28").date())
-
-    st.markdown("### Modalità ricerca")
-    search_mode = st.selectbox(
-        "Tipo di ricerca",
-        [
-            "Delibere/Affidamenti (HTML + PDF link)",
-            "Solo PDF (filetype:pdf link già in pagina)",
-            "Solo elenco portali (test connessione)"
-        ],
-        index=0
+def init_page() -> None:
+    st.set_page_config(page_title="Ricerca Progetti", layout="wide")
+    st.title(APP_TITLE)
+    st.caption(
+        "App semplificata per evitare loop in fase di boot: i carichi pesanti sono *opt-in* dal menu a sinistra."
     )
 
-    st.markdown("### Categorie + keyword")
-    categories = list(default_keywords_by_category().keys())
-    sel_cats = st.multiselect("Categorie", categories, default=["Riqualificazione urbana", "Sport"])
-    custom_kw = st.text_area(
-        "Keyword aggiuntive (una per riga, opzionale)",
-        value="affidamento progettazione\nincarico professionale\nprogetto esecutivo\nCUP\nCIG\n",
-        height=120
+
+def sidebar_settings() -> dict:
+    st.sidebar.header("⚙️ Menu")
+    page = st.sidebar.radio(
+        "Sezione",
+        ["1) Dataset", "2) Ricerca", "3) Risultati & Export", "4) Impostazioni"],
+        index=0,
     )
 
-    st.markdown("### Limiti anti-blocco (consigliato)")
-    c5, c6, c7 = st.columns([1, 1, 1])
-    with c5:
-        max_portals = st.number_input("Max portali per run", min_value=1, max_value=5000, value=30, step=1)
-    with c6:
-        max_pages = st.number_input("Max pagine per portale", min_value=1, max_value=50, value=5, step=1)
-    with c7:
-        request_timeout = st.number_input("Timeout request (sec)", min_value=3, max_value=60, value=12, step=1)
+    st.sidebar.divider()
+    st.sidebar.subheader("Modalità")
+    enable_pdf_parsing = st.sidebar.toggle("Parsing PDF (pypdf)", value=True)
+    include_unknown_date = st.sidebar.toggle("Includi record senza data", value=False)
 
-    st.markdown("### Output")
-    include_pdf_parse = st.checkbox("Apri e parse PDF (pypdf) quando trovati", value=True)
+    # Opzioni "pesanti": le mostriamo, ma non importiamo nulla se non abilitate.
+    st.sidebar.subheader("Opzioni avanzate (opt-in)")
+    enable_selenium = st.sidebar.toggle("Selenium/Chromium (se installato)", value=False)
+    enable_ocr = st.sidebar.toggle("OCR (pdf2image+tesseract) (se installato)", value=False)
+    enable_ai = st.sidebar.toggle("AI Enrichment (se configurato)", value=False)
 
-    st.session_state.config = {
-        "sel_reg": sel_reg,
-        "sel_ente": sel_ente,
-        "date_start": str(date_start),
-        "date_end": str(date_end),
-        "search_mode": search_mode,
-        "sel_cats": sel_cats,
-        "custom_kw": [k.strip() for k in custom_kw.splitlines() if k.strip()],
-        "max_portals": int(max_portals),
-        "max_pages": int(max_pages),
-        "request_timeout": int(request_timeout),
-        "include_pdf_parse": bool(include_pdf_parse),
-        "columns": {"region_col": region_col, "ente_col": ente_col, "url_col": url_col},
+    return {
+        "page": page,
+        "enable_pdf_parsing": enable_pdf_parsing,
+        "include_unknown_date": include_unknown_date,
+        "enable_selenium": enable_selenium,
+        "enable_ocr": enable_ocr,
+        "enable_ai": enable_ai,
     }
 
-    st.success("Configurazione salvata. Vai su **3) Esegui**.")
 
-# ----------------------------
-# 3) Run
-# ----------------------------
-elif section == "3) Esegui":
-    st.subheader("3) Esegui ricerca (on-demand)")
+def page_dataset() -> None:
+    st.subheader("📦 Caricamento dataset portali")
+    st.write(
+        "Per evitare blocchi all'avvio, il CSV non viene caricato automaticamente: scegli tu quando caricarlo."
+    )
 
-    if st.session_state.master_df is None:
-        st.warning("Prima carica il MASTER_SA in **1) Dati portali**.")
-        st.stop()
-    if st.session_state.config is None:
-        st.warning("Prima configura la ricerca in **2) Configura ricerca**.")
-        st.stop()
+    src = st.radio(
+        "Fonte dataset",
+        ["Dal repo (DEFAULT)", "Upload CSV"],
+        horizontal=True,
+    )
 
-    cfg = st.session_state.config
-    st.json(cfg, expanded=False)
+    default_path = os.path.join(os.getcwd(), DEFAULT_MASTER_CSV)
+    if src == "Dal repo (DEFAULT)":
+        st.code(default_path)
+        if st.button("Carica CSV dal repo", type="primary"):
+            df, warnings = load_csv_robusto(default_path)
+            st.session_state["portals_df"] = df
+            st.session_state["portals_warnings"] = warnings
+            st.success(f"Caricati {len(df):,} record dal CSV.")
 
-    if st.button("Avvia ricerca", type="primary"):
-        st.session_state.results_df = pd.DataFrame()
-        st.session_state.log_lines = []
-        log("Avvio ricerca...")
+    else:
+        up = st.file_uploader("Carica CSV portali", type=["csv"], accept_multiple_files=False)
+        if up is not None:
+            df, warnings = load_csv_robusto(up)
+            st.session_state["portals_df"] = df
+            st.session_state["portals_warnings"] = warnings
+            st.success(f"Caricati {len(df):,} record dal CSV caricato.")
 
-        master = st.session_state.master_df.copy()
-        cols = cfg["columns"]
-        region_col, ente_col, url_col = cols["region_col"], cols["ente_col"], cols["url_col"]
+    warnings = st.session_state.get("portals_warnings")
+    if warnings:
+        with st.expander("⚠️ Avvisi di parsing CSV"):
+            for w in warnings:
+                st.warning(w)
 
-        master_f = filter_master_sa(master, cfg["sel_reg"], cfg["sel_ente"], region_col=region_col, ente_col=ente_col)
-        if url_col is None:
-            st.error("Non trovo la colonna URL nel MASTER_SA. Rinominare una colonna in 'url' oppure 'link'.")
-            log("ERRORE: colonna url non trovata.")
-            st.stop()
+    df = st.session_state.get("portals_df")
+    if isinstance(df, pd.DataFrame):
+        st.caption("Anteprima dataset")
+        st.dataframe(df.head(50), use_container_width=True)
 
-        master_f = master_f.dropna(subset=[url_col]).head(cfg["max_portals"])
-        log(f"Portali selezionati: {len(master_f)} (max {cfg['max_portals']})")
 
-        with st.spinner("Ricerca in corso..."):
-            progress = st.progress(0)
-            status = st.empty()
+def page_search(opts: dict) -> None:
+    st.subheader("🔎 Ricerca")
 
-            def cb(i, total, msg):
-                progress.progress(int((i / max(total, 1)) * 100))
-                status.write(msg)
+    df = st.session_state.get("portals_df")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("Prima carica il dataset in **1) Dataset**.")
+        return
 
-            results_df, meta = run_osint_search(
-                portals_df=master_f,
-                url_col=url_col,
-                region_col=region_col,
-                ente_col=ente_col,
-                date_start=cfg["date_start"],
-                date_end=cfg["date_end"],
-                categories=cfg["sel_cats"],
-                custom_keywords=cfg["custom_kw"],
-                search_mode=cfg["search_mode"],
-                include_pdf_parse=cfg["include_pdf_parse"],
-                max_pages=cfg["max_pages"],
-                request_timeout=cfg["request_timeout"],
-                features=st.session_state.get("features", {}),
-                progress_cb=cb,
-                log_cb=log,
-            )
+    # Filtri base
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    with col1:
+        start_d = st.date_input("Data inizio", value=date(2025, 7, 1))
+    with col2:
+        end_d = st.date_input("Data fine", value=date(2026, 1, 28))
+    with col3:
+        max_portals = st.number_input("Max portali", min_value=1, max_value=5000, value=30, step=1)
+    with col4:
+        max_pdfs = st.number_input("Max PDF per portale", min_value=1, max_value=200, value=10, step=1)
 
-        st.session_state.results_df = results_df
-        st.session_state.last_run_meta = meta
-        log("Ricerca completata.")
-        st.success(f"Completato: {len(results_df)} record trovati.")
+    # Filtri per regione/comune se presenti
+    region_col = "REGIONE" if "REGIONE" in df.columns else None
+    comune_col = "COMUNE" if "COMUNE" in df.columns else None
+
+    f1, f2 = st.columns([1, 1])
+    with f1:
+        regioni = []
+        if region_col:
+            all_reg = sorted([x for x in df[region_col].dropna().unique().tolist() if str(x).strip()])
+            regioni = st.multiselect("Regioni", options=all_reg, default=[])
+        else:
+            st.caption("Colonna REGIONE non trovata nel CSV.")
+    with f2:
+        comuni = []
+        if comune_col:
+            all_com = sorted([x for x in df[comune_col].dropna().unique().tolist() if str(x).strip()])
+            comuni = st.multiselect("Comuni", options=all_com, default=[])
+        else:
+            st.caption("Colonna COMUNE non trovata nel CSV.")
+
+    filtered = df.copy()
+    if region_col and regioni:
+        filtered = filtered[filtered[region_col].isin(regioni)]
+    if comune_col and comuni:
+        filtered = filtered[filtered[comune_col].isin(comuni)]
+
+    url_col = "ALBO_PRETORIO_URL" if "ALBO_PRETORIO_URL" in filtered.columns else None
+    if not url_col:
+        st.error("Nel CSV non trovo la colonna ALBO_PRETORIO_URL.")
+        return
+
+    st.caption(f"Portali selezionati: {len(filtered):,}")
+    st.dataframe(filtered.head(20), use_container_width=True)
 
     st.divider()
-    st.subheader("Log (ultimo run)")
-    st.code("\n".join(st.session_state.log_lines[-200:]) or "Nessun log (ancora).")
+    st.subheader("Esecuzione")
+    colA, colB = st.columns([2, 1])
+    with colA:
+        st.write(
+            "La modalità *Light* usa solo requests+BeautifulSoup (più stabile su Streamlit Cloud). "
+            "Le opzioni Selenium/OCR/AI sono solo "
+            "togliere/aggiungere in futuro: qui le abiliti dal menu, ma se non sono nel requirements l'app non si rompe."
+        )
+    with colB:
+        run = st.button("🚀 Avvia ricerca", type="primary", use_container_width=True)
 
-# ----------------------------
-# 4) Results & Export
-# ----------------------------
-elif section == "4) Risultati & Export":
-    st.subheader("4) Risultati & Export")
+    if not run:
+        return
 
-    df = st.session_state.results_df
-    if df is None or df.empty:
-        st.info("Nessun risultato. Vai su **3) Esegui** e lancia una ricerca.")
-        st.stop()
+    with st.spinner("Ricerca in corso..."):
+        results = search_portals_light(
+            portals_df=filtered.head(int(max_portals)),
+            start_date=start_d,
+            end_date=end_d,
+            max_pdfs_per_portal=int(max_pdfs),
+            parse_pdf=bool(opts["enable_pdf_parsing"]),
+            include_unknown_date=bool(opts["include_unknown_date"]),
+        )
 
-    meta = st.session_state.get("last_run_meta", {})
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        st.metric("Record", len(df))
-    with c2:
-        st.metric("Portali scansionati", meta.get("portals_scanned", 0))
-    with c3:
-        st.write(f"Periodo: **{meta.get('date_start','?')} → {meta.get('date_end','?')}**")
+    st.session_state["results_df"] = pd.DataFrame(results)
+    st.success(f"Completato. Record estratti: {len(st.session_state['results_df']):,}")
+
+
+def page_results() -> None:
+    st.subheader("📤 Risultati & Export")
+    df = st.session_state.get("results_df")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("Nessun risultato ancora. Vai su **2) Ricerca**.")
+        return
 
     st.dataframe(df, use_container_width=True, height=520)
+    st.divider()
 
-    st.markdown("### Segmentazione (placeholder)")
-    seg_df = segment_leads_placeholder(df)
-    st.dataframe(seg_df, use_container_width=True)
-
-    st.markdown("### Export")
-    excel_bytes = df_to_excel_bytes(results_df=df, segments_df=seg_df, meta=meta)
-
+    csv_bytes = dataframe_to_csv_bytes(df)
     st.download_button(
-        "⬇️ Scarica Excel (risultati + segmenti)",
-        data=excel_bytes,
-        file_name="ricerca_progetti_export.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.download_button(
-        "⬇️ Scarica CSV risultati",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="results.csv",
+        "⬇️ Scarica risultati (CSV)",
+        data=csv_bytes,
+        file_name="risultati_osint.csv",
         mime="text/csv",
+        use_container_width=True,
     )
 
-# ----------------------------
-# Settings / Diagnostics
-# ----------------------------
-else:
-    st.subheader("Impostazioni & Diagnostica")
-    st.write("Verifica installazione feature opzionali senza rompere l'avvio.")
 
-    checks = {}
-    for mod in ["plotly.express", "selenium", "pytesseract", "pdf2image", "anthropic", "groq"]:
+def page_settings(opts: dict) -> None:
+    st.subheader("🧩 Impostazioni / Diagnostica")
+    st.write("Questa sezione serve per capire subito *cosa è installato* e cosa no.")
+
+    st.markdown("#### Stato dipendenze opzionali")
+
+    def _check(modname: str) -> str:
         try:
-            __import__(mod.split(".")[0])
-            checks[mod] = "OK"
-        except Exception as e:
-            checks[mod] = f"NON INSTALLATO ({type(e).__name__})"
-    st.json(checks)
+            __import__(modname)
+            return "✅"
+        except Exception:
+            return "❌"
 
-    st.markdown("### Performance (Streamlit Cloud)")
-    st.write(
-        "- `packages.txt` vuoto = boot rapido.\n"
-        "- Abilita OCR/Selenium solo se serve davvero.\n"
-        "- Tieni bassi: max portali / max pagine / timeout.\n"
-        "- Nessun import pesante in top-level (già sistemato)."
+    rows = [
+        ("plotly", _check("plotly")),
+        ("selenium", _check("selenium")),
+        ("pdf2image", _check("pdf2image")),
+        ("pytesseract", _check("pytesseract")),
+        ("anthropic", _check("anthropic")),
+        ("groq", _check("groq")),
+    ]
+    st.table(pd.DataFrame(rows, columns=["Modulo", "Disponibile"]))
+
+    st.markdown(
+        "**Nota:** se attivi Selenium/OCR/AI dal menu ma qui vedi ❌, devi aggiungere le dipendenze in requirements.txt."
     )
+
+    st.markdown("#### Opzioni attuali")
+    st.json(opts)
+
+
+def main() -> None:
+    init_page()
+    opts = sidebar_settings()
+
+    page = opts["page"]
+    if page.startswith("1"):
+        page_dataset()
+    elif page.startswith("2"):
+        page_search(opts)
+    elif page.startswith("3"):
+        page_results()
+    else:
+        page_settings(opts)
+
+
+if __name__ == "__main__":
+    main()

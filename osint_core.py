@@ -1,253 +1,286 @@
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
-import urllib.parse
+from datetime import date, datetime
+from io import BytesIO
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 
-from utils import safe_to_datetime, extract_pdf_text_basic, guess_date_in_text
 
-ProgressCB = Optional[Callable[[int, int, str], None]]
-LogCB = Optional[Callable[[str], None]]
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
 
 @dataclass
-class FoundItem:
-    region: str
+class ProjectHit:
     ente: str
-    portal_url: str
-    page_url: str
-    title: str
-    doc_type: str
-    published_date: str
-    keywords_hit: str
+    regione: str
+    source_page: str
     pdf_url: str
+    titolo: str
+    data_atto: Optional[date]
+    progettista: str
+    email: str
+    telefono: str
     cup: str
     cig: str
-    amount: str
-    designer: str
-    email: str
-    phone: str
-    extraction_notes: str
+    importo: str
+    descrizione: str
 
-def default_keywords_by_category() -> Dict[str, List[str]]:
-    return {
-        "Sport": ["palazzetto", "piscina", "palestra", "stadio", "polisportivo", "impianto sportivo", "campo", "tennis", "nuoto", "arena"],
-        "Piste ciclabili": ["pista ciclabile", "ciclopedonale", "ciclovia", "greenway", "bike lane", "ciclo", "mobilità dolce", "percorso cicl", "anello ciclabile", "ciclo-pedonale"],
-        "Riqualificazione urbana": ["riqualificazione", "rigenerazione", "piano urbano", "restyling", "recupero", "rifunzionalizzazione", "arredo urbano", "manutenzione straordinaria", "centro storico", "piazza"],
-        "Sanitario": ["ospedale", "poliambulatorio", "RSA", "pronto soccorso", "terapia intensiva", "dialisi", "consultorio", "ambulatorio", "struttura sanitaria", "casa della comunità"],
-        "Musei": ["museo", "pinacoteca", "galleria", "allestimento", "musealizzazione", "centro culturale", "spazio espositivo", "restauro", "museo civico", "museo d'arte"],
-        "Università": ["campus", "aula", "laboratorio", "dipartimento", "studentato", "biblioteca", "polo universitario", "mensa universitaria", "residenza studenti", "università"],
-        "Innovazione": ["hub", "incubatore", "coworking", "fab lab", "innovazione", "digital", "smart", "laboratorio", "centro ricerca", "competence center"],
-        "ERP": ["edilizia residenziale pubblica", "ERP", "case popolari", "alloggi", "housing", "residenze", "edilizia pubblica", "ristrutturazione alloggi", "riqualificazione energetica", "manutenzione alloggi"],
-        "TPL": ["trasporto pubblico", "autostazione", "capolinea", "deposito bus", "tram", "metropolitana", "fermata", "stazione", "intermodalità", "bus"],
-        "Edilizia giudiziaria": ["tribunale", "procura", "palazzo di giustizia", "uffici giudiziari", "corte", "giudice", "aula udienza", "carcere", "casa circondariale", "ufficio giudice pace"],
-        "Archivi": ["archivio", "deposito archivistico", "biblioteca", "archivio storico", "digitalizzazione archivi", "polo archivistico", "riordino archivi", "archivistica", "sala consultazione", "conservazione"],
-        "Intrattenimento": ["teatro", "cinema", "auditorium", "arena", "spettacolo", "sala eventi", "centro congressi", "palco", "festival", "anfiteatro"],
-        "Aeroporti": ["aeroporto", "terminal", "pista", "hangar", "aerostazione", "piazzale", "sicurezza aeroportuale", "parcheggi aeroporto"],
-        "Centri commerciali": ["centro commerciale", "galleria commerciale", "retail park", "ipermercato", "mall", "parcheggio", "ampliamento", "negozi", "food court"],
-        "Alberghi": ["hotel", "albergo", "resort", "ospitalità", "camere", "spa", "struttura ricettiva", "boutique hotel"],
-    }
 
-def _normalize_url(u: str) -> str:
-    u = (u or "").strip()
-    if not u:
-        return u
-    if not u.startswith("http"):
-        u = "https://" + u
-    return u
+def _safe_str(x: object) -> str:
+    return "" if x is None else str(x)
 
-def _fetch(url: str, timeout_s: int) -> Optional[str]:
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; RicercaProgetti/1.0; +https://streamlit.app)"}
-    r = requests.get(url, headers=headers, timeout=timeout_s, allow_redirects=True)
-    if r.status_code >= 400:
-        return None
-    return r.text
 
-def _extract_links(base_url: str, html: str) -> List[str]:
-    soup = BeautifulSoup(html, "lxml")
-    links = []
-    for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
+def _requests_get(url: str, *, timeout: int = 20) -> requests.Response:
+    return requests.get(
+        url,
+        timeout=timeout,
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/pdf,*/*"},
+        allow_redirects=True,
+    )
+
+
+def discover_pdf_links(page_url: str, *, max_links: int = 30, timeout: int = 20) -> List[str]:
+    """Estrae link a PDF da una pagina (approccio light: requests+bs4)."""
+    try:
+        r = _requests_get(page_url, timeout=timeout)
+        r.raise_for_status()
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(r.text, "lxml")
+    out: List[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a.get("href")
         if not href:
             continue
-        links.append(urllib.parse.urljoin(base_url, href))
-
-    seen = set()
-    out = []
-    for x in links:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
+        if ".pdf" not in href.lower():
+            continue
+        full = requests.compat.urljoin(page_url, href)
+        if full not in out:
+            out.append(full)
+        if len(out) >= max_links:
+            break
     return out
 
-def _keyword_hit(text: str, keywords: List[str]) -> List[str]:
-    t = (text or "").lower()
-    hits = []
-    for k in keywords:
-        kk = k.lower().strip()
-        if kk and kk in t:
-            hits.append(k)
-    return hits
 
-def _extract_title(html: str) -> str:
-    soup = BeautifulSoup(html, "lxml")
-    title = soup.title.text.strip() if soup.title and soup.title.text else ""
-    return title[:200]
-
-def run_osint_search(
-    portals_df: pd.DataFrame,
-    url_col: str,
-    region_col: Optional[str],
-    ente_col: Optional[str],
-    date_start: str,
-    date_end: str,
-    categories: List[str],
-    custom_keywords: List[str],
-    search_mode: str,
-    include_pdf_parse: bool,
-    max_pages: int,
-    request_timeout: int,
-    features: Dict,
-    progress_cb: ProgressCB = None,
-    log_cb: LogCB = None,
-) -> Tuple[pd.DataFrame, Dict]:
-    kw_map = default_keywords_by_category()
-    keywords: List[str] = []
-    for c in categories:
-        keywords.extend(kw_map.get(c, []))
-    keywords.extend(custom_keywords or [])
-
-    # de-dup
-    seen = set()
-    keywords = [k for k in keywords if k and not (k.lower() in seen or seen.add(k.lower()))]
-
-    ds = safe_to_datetime(date_start)
-    de = safe_to_datetime(date_end)
-
-    found: List[FoundItem] = []
-    total = len(portals_df)
-
-    for i, row in enumerate(portals_df.to_dict(orient="records"), start=1):
-        portal_url = _normalize_url(str(row.get(url_col, "")))
-        region = str(row.get(region_col, "")) if region_col else ""
-        ente = str(row.get(ente_col, "")) if ente_col else ""
-
-        msg = f"({i}/{total}) Scansione: {ente or 'ENTE?'} — {portal_url}"
-        if progress_cb:
-            progress_cb(i - 1, total, msg)
-        if log_cb:
-            log_cb(msg)
-
-        try:
-            html = _fetch(portal_url, timeout_s=request_timeout)
-        except Exception as e:
-            if log_cb:
-                log_cb(f"  ✗ errore fetch: {type(e).__name__}: {e}")
-            continue
-
-        if not html:
-            if log_cb:
-                log_cb("  ✗ nessuna risposta / status >=400")
-            continue
-
-        root_title = _extract_title(html)
-        root_hits = _keyword_hit(html + " " + root_title, keywords)
-        root_links = _extract_links(portal_url, html)
-
-        if search_mode == "Solo elenco portali (test connessione)":
-            found.append(FoundItem(
-                region=region, ente=ente, portal_url=portal_url, page_url=portal_url,
-                title=root_title or "(home)", doc_type="PORTAL_OK",
-                published_date="", keywords_hit=",".join(root_hits[:10]),
-                pdf_url="", cup="", cig="", amount="", designer="", email="", phone="",
-                extraction_notes="Connectivity OK",
-            ))
-            continue
-
-        # pick only a few relevant pages to avoid loops
-        priority_terms = ["albo", "trasparente", "delib", "determin", "affid", "atti", "bandi", "gara", "provved"]
-        cand = []
-        for u in root_links:
-            lu = u.lower()
-            score = sum(1 for t in priority_terms if t in lu)
-            if score > 0:
-                cand.append((score, u))
-        cand.sort(reverse=True, key=lambda x: x[0])
-
-        pages = [portal_url] + [u for _, u in cand[:max_pages - 1]]
-        pages = pages[:max_pages]
-
-        for p in pages:
+def fetch_pdf_text(pdf_url: str, *, timeout: int = 30, max_pages: int = 12) -> str:
+    """Scarica un PDF e prova a estrarre testo via pypdf."""
+    try:
+        r = _requests_get(pdf_url, timeout=timeout)
+        r.raise_for_status()
+        reader = PdfReader(BytesIO(r.content))
+        texts: List[str] = []
+        for i, page in enumerate(reader.pages[:max_pages]):
             try:
-                ph = _fetch(p, timeout_s=request_timeout)
-            except Exception as e:
-                if log_cb:
-                    log_cb(f"  - skip page fetch error: {p} ({type(e).__name__})")
-                continue
-            if not ph:
-                continue
+                t = page.extract_text() or ""
+            except Exception:
+                t = ""
+            if t:
+                texts.append(t)
+        return "\n".join(texts)
+    except Exception:
+        return ""
 
-            page_title = _extract_title(ph) or p
-            hits = _keyword_hit(ph + " " + page_title, keywords)
-            if not hits and p != portal_url:
-                continue
 
-            links = _extract_links(p, ph)
-            pdfs = [u for u in links if u.lower().endswith(".pdf") or ".pdf?" in u.lower()]
+_RE_EMAIL = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+_RE_TEL = re.compile(r"(?:\+?39\s*)?(?:\(?0\d{1,3}\)?\s*)?\d{6,10}")
+_RE_CUP = re.compile(r"\b[A-Z]\d{2}[A-Z0-9]{10,}\b")
+_RE_CIG = re.compile(r"\b[0-9A-F]{10}\b", re.I)
 
-            for pdf_url in pdfs[:30]:  # hard cap per page
-                published = ""
-                cup = cig = ""
-                email = phone = ""
-                notes = ""
 
-                if include_pdf_parse:
-                    try:
-                        text = extract_pdf_text_basic(pdf_url, timeout_s=request_timeout)
-                        published = guess_date_in_text(text) or ""
+def _first_match(regex: re.Pattern, text: str) -> str:
+    m = regex.search(text or "")
+    return m.group(0).strip() if m else ""
 
-                        cup_m = re.search(r"\bCUP\b[:\s]*([A-Z0-9]{6,})", text, flags=re.I)
-                        cig_m = re.search(r"\bCIG\b[:\s]*([A-Z0-9]{6,})", text, flags=re.I)
-                        cup = cup_m.group(1).strip() if cup_m else ""
-                        cig = cig_m.group(1).strip() if cig_m else ""
 
-                        email_m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", text, flags=re.I)
-                        email = email_m.group(1) if email_m else ""
+def parse_date_from_text(text: str) -> Optional[date]:
+    """Cerca una data dd/mm/yyyy o dd-mm-yyyy in un testo."""
+    if not text:
+        return None
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", text)
+    if not m:
+        return None
+    d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return date(y, mo, d)
+    except Exception:
+        return None
 
-                        phone_m = re.search(r"\b(?:\+?39)?\s*(?:0\d{1,3}|\d{3})[\s\-./]?\d{5,8}\b", text)
-                        phone = phone_m.group(0).strip() if phone_m else ""
 
-                        if published:
-                            dt = safe_to_datetime(published)
-                            if dt is not None and ds is not None and de is not None and (dt < ds or dt > de):
-                                continue
-                    except Exception as e:
-                        notes = f"PDF parse error: {type(e).__name__}"
-                else:
-                    notes = "PDF parse disabilitato"
+def parse_project_fields(text: str) -> Dict[str, str | Optional[date]]:
+    if not text:
+        return {
+            "titolo": "",
+            "data_atto": None,
+            "progettista": "",
+            "email": "",
+            "telefono": "",
+            "cup": "",
+            "cig": "",
+            "importo": "",
+            "descrizione": "",
+        }
 
-                found.append(FoundItem(
-                    region=region, ente=ente, portal_url=portal_url, page_url=p,
-                    title=page_title[:200], doc_type="PDF_LINK",
-                    published_date=published,
-                    keywords_hit=",".join(hits[:12]),
-                    pdf_url=pdf_url, cup=cup, cig=cig,
-                    amount="", designer="", email=email, phone=phone,
-                    extraction_notes=notes,
-                ))
+    # titolo: prima riga non vuota abbastanza lunga
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    titolo = ""
+    for ln in lines[:25]:
+        if len(ln) >= 25:
+            titolo = ln
+            break
 
-        if progress_cb:
-            progress_cb(i, total, f"Completato {i}/{total}")
+    email = _first_match(_RE_EMAIL, text)
+    tel = _first_match(_RE_TEL, text)
+    cup = _first_match(_RE_CUP, text)
+    cig = _first_match(_RE_CIG, text)
+    data_atto = parse_date_from_text(text)
 
-    df = pd.DataFrame([f.__dict__ for f in found])
-    meta = {
-        "portals_scanned": int(total),
-        "date_start": date_start,
-        "date_end": date_end,
-        "keywords_count": len(keywords),
-        "search_mode": search_mode,
-        "include_pdf_parse": include_pdf_parse,
+    # progettista: euristica semplice
+    progettista = ""
+    for pattern in [
+        r"progettist[ai]\s*[:\-]\s*(.{3,80})",
+        r"affidatari[oa]\s*[:\-]\s*(.{3,80})",
+        r"incaricat[oa]\s*[:\-]\s*(.{3,80})",
+        r"studio\s*[:\-]\s*(.{3,80})",
+    ]:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            progettista = re.sub(r"\s+", " ", m.group(1)).strip()
+            break
+
+    # importo
+    imp = ""
+    m = re.search(r"\b(?:importo|corrispettivo|€|euro)\b[^\n]{0,40}?(\d{1,3}(?:[\.,]\d{3})*(?:[\.,]\d{2})?)", text, flags=re.I)
+    if m:
+        imp = m.group(1)
+
+    descr = ""
+    # descrizione: prova a prendere qualche riga dopo 'OGGETTO'
+    m = re.search(r"\bOGGETTO\b\s*[:\-]?\s*(.{10,200})", text, flags=re.I)
+    if m:
+        descr = m.group(1).strip()
+
+    return {
+        "titolo": titolo,
+        "data_atto": data_atto,
+        "progettista": progettista,
+        "email": email,
+        "telefono": tel,
+        "cup": cup,
+        "cig": cig,
+        "importo": imp,
+        "descrizione": descr,
     }
-    return df, meta
+
+
+def _get_portal_fields(row: pd.Series) -> Tuple[str, str, str]:
+    # Compatibilità: molte versioni del CSV usano nomi colonne diversi.
+    ente = (
+        row.get("ente")
+        or row.get("ENTE")
+        or row.get("amministrazione")
+        or row.get("AMMINISTRAZIONE")
+        or row.get("stazione_appaltante")
+        or ""
+    )
+    regione = row.get("regione") or row.get("REGIONE") or ""
+    url = (
+        row.get("url")
+        or row.get("URL")
+        or row.get("albo_url")
+        or row.get("ALBO_URL")
+        or row.get("link")
+        or row.get("LINK")
+        or ""
+    )
+    return _safe_str(ente).strip(), _safe_str(regione).strip(), _safe_str(url).strip()
+
+
+def search_portals_light(
+    portals: pd.DataFrame,
+    *,
+    start: date,
+    end: date,
+    include_unknown_date: bool = False,
+    max_portals: int = 10,
+    max_pdfs_per_portal: int = 10,
+    timeout_s: int = 20,
+) -> pd.DataFrame:
+    """Ricerca "light" pensata per Streamlit Cloud.
+
+    - Non usa Selenium
+    - Estrae link PDF dalle pagine fornite nel CSV
+    - Prova a leggere testo dal PDF e a tirar fuori campi principali
+    - Filtra per data se trovata
+    """
+
+    hits: List[ProjectHit] = []
+
+    df = portals.copy()
+    if len(df) == 0:
+        return pd.DataFrame()
+
+    for _, row in df.head(max_portals).iterrows():
+        ente, regione, page_url = _get_portal_fields(row)
+        if not page_url:
+            continue
+        pdfs = discover_pdf_links(page_url, max_links=max_pdfs_per_portal, timeout=timeout_s)
+        for pdf_url in pdfs:
+            text = fetch_pdf_text(pdf_url, timeout=timeout_s)
+            fields = parse_project_fields(text)
+            data_atto: Optional[date] = fields["data_atto"]  # type: ignore[assignment]
+
+            # filtro date
+            if data_atto is None and not include_unknown_date:
+                continue
+            if data_atto is not None and not (start <= data_atto <= end):
+                continue
+
+            hits.append(
+                ProjectHit(
+                    ente=ente,
+                    regione=regione,
+                    source_page=page_url,
+                    pdf_url=pdf_url,
+                    titolo=str(fields["titolo"] or ""),
+                    data_atto=data_atto,
+                    progettista=str(fields["progettista"] or ""),
+                    email=str(fields["email"] or ""),
+                    telefono=str(fields["telefono"] or ""),
+                    cup=str(fields["cup"] or ""),
+                    cig=str(fields["cig"] or ""),
+                    importo=str(fields["importo"] or ""),
+                    descrizione=str(fields["descrizione"] or ""),
+                )
+            )
+
+    out = pd.DataFrame(
+        [
+            {
+                "ENTE": h.ente,
+                "REGIONE": h.regione,
+                "SOURCE_PAGE": h.source_page,
+                "PDF_URL": h.pdf_url,
+                "TITOLO": h.titolo,
+                "DATA_ATTO": h.data_atto.isoformat() if h.data_atto else "",
+                "PROGETTISTA": h.progettista,
+                "EMAIL": h.email,
+                "TELEFONO": h.telefono,
+                "CUP": h.cup,
+                "CIG": h.cig,
+                "IMPORTO": h.importo,
+                "DESCRIZIONE": h.descrizione,
+            }
+            for h in hits
+        ]
+    )
+    return out

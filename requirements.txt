@@ -1,3 +1,4 @@
+# Core (leggero, compatibile Streamlit Cloud)
 streamlit==1.38.0
 pandas==2.2.2
 requests==2.32.3
@@ -8,11 +9,15 @@ openpyxl==3.1.2
 python-dotenv==1.0.1
 dnspython==2.6.1
 
-# opzionali (abilita solo se ti servono)
+# Opzionale UI (abilitato solo se lo usi nel codice)
 # plotly==5.22.0
+
+# AI providers (opzionali)
+# anthropic==0.34.2
+# groq==0.11.0
+
+# Optional heavy deps (NON consigliate su Cloud se non necessarie)
 # selenium==4.25.0
 # pdf2image==1.17.0
 # pytesseract==0.3.13
 # Pillow==10.4.0
-# anthropic==0.34.2
-# groq==0.11.0
