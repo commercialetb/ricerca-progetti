@@ -994,8 +994,7 @@ def page_dataset():
 
 def page_search(state):
     st.header("🧭 Ricerca")
-
-        st.markdown("### Sorgenti URL")
+    st.markdown("### Sorgenti URL")
 
     # 1) URL singolo (nuovo)
     single_url = st.text_input(
