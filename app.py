@@ -1,232 +1,338 @@
-import os
-from datetime import datetime
-
+import time
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
 
-from ai_enrichment import ai_enrich_contacts
-from osint_agent_antibot_v3_2 import CATEGORIES
-from osint_core import run_scraping_light, run_scraping_selenium
-from utils import create_csv_segments, create_excel_4sheets
-
-load_dotenv()
-
-st.set_page_config(
-    page_title="🧠 OSINT Agent Enterprise",
-    page_icon="🧠",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from osint_core import run_osint_search, default_keywords_by_category
+from utils import (
+    load_master_sa,
+    filter_master_sa,
+    df_to_excel_bytes,
+    segment_leads_placeholder,
 )
 
-st.title("🧠 OSINT Agent Enterprise (Cloud-safe)")
-st.caption(
-    "Modalità leggera di default (no Selenium/OCR). Abilita funzioni pesanti solo se hai installato le dipendenze."
+APP_TITLE = "Ricerca Progetti Italia — Streamlit (Anti-loop)"
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+# ----------------------------
+# Session state defaults
+# ----------------------------
+if "master_df" not in st.session_state:
+    st.session_state.master_df = None
+if "results_df" not in st.session_state:
+    st.session_state.results_df = pd.DataFrame()
+if "log_lines" not in st.session_state:
+    st.session_state.log_lines = []
+if "last_run_meta" not in st.session_state:
+    st.session_state.last_run_meta = {}
+if "config" not in st.session_state:
+    st.session_state.config = None
+
+def log(msg: str):
+    ts = time.strftime("%H:%M:%S")
+    st.session_state.log_lines.append(f"[{ts}] {msg}")
+
+# ----------------------------
+# Sidebar: menu
+# ----------------------------
+st.sidebar.title("Menu")
+section = st.sidebar.radio(
+    "Sezione",
+    ["1) Dati portali", "2) Configura ricerca", "3) Esegui", "4) Risultati & Export", "Impostazioni"],
 )
 
-# ---------------- Sidebar ----------------
-st.sidebar.header("⚙️ Configurazione")
+st.title(APP_TITLE)
+st.caption("Boot veloce: niente scraping / OCR / Selenium all'avvio. Tutto parte solo quando premi **Avvia ricerca**.")
 
-feature_plotly = st.sidebar.toggle(
-    "📊 Dashboard Plotly",
-    value=False,
-    help="Richiede plotly installato (è in requirements).",
-)
-feature_selenium = st.sidebar.toggle(
-    "🧭 Scraping Selenium (anti-bot)",
-    value=False,
-    help="Richiede selenium + chromium + chromium-driver.",
-)
-feature_ai = st.sidebar.toggle(
-    "🤖 AI Enrichment",
-    value=False,
-    help="Richiede chiave API + provider.",
-)
-feature_ocr = st.sidebar.toggle(
-    "🖼 OCR PDF (lento)",
-    value=False,
-    help="Richiede pdf2image + pytesseract + poppler + tesseract.",
-)
+# ----------------------------
+# Frontend toggles (feature flags)
+# ----------------------------
+with st.sidebar.expander("Feature (toggle)", expanded=False):
+    enable_plotly = st.toggle("Abilita grafici Plotly (se installato)", value=False)
+    enable_ai = st.toggle("Abilita AI enrichment (se installato/configurato)", value=False)
+    enable_selenium = st.toggle("Abilita Selenium (richiede chromium + driver)", value=False)
+    enable_ocr = st.toggle("Abilita OCR PDF (richiede poppler + tesseract)", value=False)
 
-st.sidebar.divider()
+st.session_state["features"] = {
+    "plotly": enable_plotly,
+    "ai": enable_ai,
+    "selenium": enable_selenium,
+    "ocr": enable_ocr,
+}
 
-api_provider = st.sidebar.selectbox(
-    "AI Provider", ["Claude (Anthropic)", "Groq"], disabled=not feature_ai
-)
-api_key = st.sidebar.text_input("API Key", type="password", disabled=not feature_ai)
+# ----------------------------
+# 1) Load portals (MASTER_SA)
+# ----------------------------
+if section == "1) Dati portali":
+    st.subheader("1) Carica portali (MASTER_SA)")
+    st.write("Puoi usare il CSV nel repo (consigliato) oppure caricarne uno manualmente.")
 
-max_pages = st.sidebar.slider(
-    "Pagine da scansionare per portale (light)", 1, 10, 5, disabled=feature_selenium
-)
-max_pdf = st.sidebar.slider("PDF max per portale", 5, 60, 20)
+    col1, col2 = st.columns([1, 1])
 
-st.sidebar.info(
-    "⚡ Per avvio rapido su Streamlit Cloud: lascia disattivato Selenium/OCR. "
-    "Se li attivi senza dipendenze di sistema, vedrai un errore chiaro."
-)
-
-# ---------------- Upload CSV ----------------
-uploaded_file = st.file_uploader("📂 CSV Portali (obbligatorio)", type="csv")
-
-capoluoghi_df = None
-if uploaded_file:
-    capoluoghi_df = pd.read_csv(uploaded_file)
-    st.success(f"Caricato: {len(capoluoghi_df)} portali")
-
-    preview_cols = [
-        c
-        for c in ["COMUNE", "PROVINCIA", "REGIONE", "ALBO_PRETORIO_URL"]
-        if c in capoluoghi_df.columns
-    ]
-    if preview_cols:
-        st.dataframe(capoluoghi_df[preview_cols].head(20), use_container_width=True)
-else:
-    st.warning("Carica un CSV per iniziare.")
-
-tab1, tab2, tab3, tab4 = st.tabs(["🚀 Scraping", "📊 Dashboard", "🤖 AI Enrichment", "📈 Export"])
-
-# ---------------- Tab 1: Scraping ----------------
-with tab1:
-    st.subheader("1) Scraping Portali")
-
-    if capoluoghi_df is None:
-        st.info("Carica il CSV dei portali.")
-    else:
-        colA, colB = st.columns([2, 1])
-        with colA:
-            if st.button("🚀 Avvia Scraping", type="primary", use_container_width=True):
-                with st.spinner("Scraping in corso..."):
-                    portals = capoluoghi_df.to_dict("records")
-
-                    try:
-                        if feature_selenium:
-                            raw = run_scraping_selenium(portals, max_pdf_per_portale=max_pdf)
-                        else:
-                            raw = run_scraping_light(
-                                portals,
-                                max_pdf_per_portale=max_pdf,
-                                max_pages_per_portale=max_pages,
-                            )
-
-                        st.session_state["raw_projects"] = raw
-                        st.success(f"Scraping completato! Record: {len(raw)}")
-                    except Exception as e:
-                        st.error(f"Errore scraping: {e}")
-
-        with colB:
-            st.metric("Portali nel CSV", len(capoluoghi_df))
-
-        if "raw_projects" in st.session_state:
-            df_raw = pd.DataFrame(st.session_state["raw_projects"])
-            st.dataframe(df_raw, height=450, use_container_width=True)
-
-# ---------------- Tab 2: Dashboard ----------------
-with tab2:
-    st.subheader("2) Dashboard")
-    if "raw_projects" not in st.session_state:
-        st.info("Esegui lo scraping per vedere la dashboard.")
-    else:
-        df = pd.DataFrame(st.session_state["raw_projects"])
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Record", len(df))
-        col2.metric(
-            "PDF OK",
-            int((~df.get("error", pd.Series([None] * len(df))).notna()).sum()) if len(df) else 0,
+    with col1:
+        default_path = st.text_input(
+            "Percorso CSV MASTER_SA nel repo",
+            value="MASTER_SA_gare_links_NORMALIZED.csv",
+            help="Metti il file nella root del repo. In alternativa usa upload qui sotto."
         )
-        col3.metric("Regioni", df["regione"].nunique() if "regione" in df.columns else 0)
-
-        if feature_plotly:
+        if st.button("Carica dal repo", type="primary"):
             try:
-                import plotly.express as px  # lazy import
-
-                if "regione" in df.columns:
-                    chart = df["regione"].value_counts().reset_index()
-                    chart.columns = ["regione", "count"]
-                    fig = px.bar(chart, x="regione", y="count", title="Record per Regione")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.warning("Colonna 'regione' non trovata nei dati.")
+                df = load_master_sa(default_path)
+                st.session_state.master_df = df
+                log(f"MASTER_SA caricato dal repo: {default_path} ({len(df)} righe)")
+                st.success(f"Caricato: {len(df)} righe")
             except Exception as e:
-                st.error(f"Plotly non disponibile o errore: {e}")
-        else:
-            st.info("Attiva 'Dashboard Plotly' nella sidebar per i grafici.")
+                st.error(f"Errore caricamento dal repo: {e}")
+                log(f"ERRORE load_master_sa: {e}")
 
-# ---------------- Tab 3: AI Enrichment ----------------
-with tab3:
-    st.subheader("3) AI Enrichment contatti")
-    if "raw_projects" not in st.session_state:
-        st.info("Esegui lo scraping prima.")
-    else:
-        if not feature_ai:
-            st.info("Attiva 'AI Enrichment' nella sidebar (e inserisci API key).")
-        else:
-            if st.button("🤖 Arricchisci con AI", use_container_width=True):
-                with st.spinner("Arricchimento in corso..."):
-                    provider = "Claude (Anthropic)" if "claude" in api_provider.lower() else "Groq"
-                    enriched = ai_enrich_contacts(
-                        st.session_state["raw_projects"], api_key=api_key, provider=provider
-                    )
-                    st.session_state["enriched_leads"] = enriched
-                    st.success("Enrichment completato!")
+    with col2:
+        up = st.file_uploader("Oppure carica CSV MASTER_SA", type=["csv"])
+        if up is not None and st.button("Usa CSV caricato"):
+            try:
+                df = pd.read_csv(up)
+                st.session_state.master_df = df
+                log(f"MASTER_SA caricato da upload ({len(df)} righe)")
+                st.success(f"Caricato: {len(df)} righe")
+            except Exception as e:
+                st.error(f"Errore lettura CSV: {e}")
+                log(f"ERRORE read_csv(upload): {e}")
 
-        if "enriched_leads" in st.session_state:
-            df_leads = pd.DataFrame(st.session_state["enriched_leads"])
-            show_cols = [
-                c
-                for c in [
-                    "progettista_norm",
-                    "email",
-                    "telefono",
-                    "validation_score",
-                    "lead_quality_score",
-                    "error_ai",
-                    "pdf_source",
-                ]
-                if c in df_leads.columns
-            ]
-            st.dataframe(df_leads[show_cols], height=500, use_container_width=True)
+    if st.session_state.master_df is not None:
+        st.divider()
+        st.subheader("Anteprima e filtri rapidi")
 
-# ---------------- Tab 4: Export ----------------
-with tab4:
-    st.subheader("4) Export")
+        df = st.session_state.master_df.copy()
+        cols = {c.lower(): c for c in df.columns}
+        region_col = cols.get("regione") or cols.get("region")
+        ente_col = cols.get("ente") or cols.get("amministrazione") or cols.get("stazione_appaltante")
+        url_col = cols.get("url") or cols.get("link") or cols.get("sito") or cols.get("domain")
 
-    if "enriched_leads" not in st.session_state and "raw_projects" not in st.session_state:
-        st.info("Esegui scraping (e opzionalmente enrichment) per esportare.")
-    else:
-        data_for_export = (
-            st.session_state.get("enriched_leads")
-            or st.session_state.get("raw_projects")
-            or []
-        )
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            regioni = sorted(df[region_col].dropna().unique().tolist()) if region_col else []
+            sel_reg = st.multiselect("Regioni", regioni, default=[])
+        with c2:
+            enti = sorted(df[ente_col].dropna().unique().tolist()) if ente_col else []
+            sel_ente = st.multiselect("Enti", enti, default=[])
+        with c3:
+            st.write("Colonne rilevate")
+            st.json({"regione": region_col, "ente": ente_col, "url": url_col})
 
-        col1, col2, col3 = st.columns(3)
+        df_f = filter_master_sa(df, sel_reg, sel_ente, region_col=region_col, ente_col=ente_col)
+        st.write(f"Righe dopo filtro: **{len(df_f)}**")
+        st.dataframe(df_f.head(200), use_container_width=True)
 
-        with col1:
-            xlsx = create_excel_4sheets(data_for_export)
-            st.download_button(
-                "📊 Scarica Excel (4 sheet)",
-                data=xlsx,
-                file_name=f"osint_export_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+# ----------------------------
+# 2) Configure search
+# ----------------------------
+elif section == "2) Configura ricerca":
+    st.subheader("2) Configura ricerca")
+
+    master = st.session_state.master_df
+    if master is None:
+        st.warning("Prima carica il MASTER_SA in **1) Dati portali**.")
+        st.stop()
+
+    cols = {c.lower(): c for c in master.columns}
+    region_col = cols.get("regione") or cols.get("region")
+    ente_col = cols.get("ente") or cols.get("amministrazione") or cols.get("stazione_appaltante")
+    url_col = cols.get("url") or cols.get("link") or cols.get("sito") or cols.get("domain")
+
+    st.markdown("### Target (filtri portali)")
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        regioni = sorted(master[region_col].dropna().unique().tolist()) if region_col else []
+        sel_reg = st.multiselect("Regioni (opzionale)", regioni, default=[])
+    with c2:
+        enti = sorted(master[ente_col].dropna().unique().tolist()) if ente_col else []
+        sel_ente = st.multiselect("Enti (opzionale)", enti, default=[])
+
+    st.markdown("### Periodo atti (obbligatorio)")
+    c3, c4 = st.columns([1, 1])
+    with c3:
+        date_start = st.date_input("Data inizio", value=pd.to_datetime("2025-07-01").date())
+    with c4:
+        date_end = st.date_input("Data fine", value=pd.to_datetime("2026-01-28").date())
+
+    st.markdown("### Modalità ricerca")
+    search_mode = st.selectbox(
+        "Tipo di ricerca",
+        [
+            "Delibere/Affidamenti (HTML + PDF link)",
+            "Solo PDF (filetype:pdf link già in pagina)",
+            "Solo elenco portali (test connessione)"
+        ],
+        index=0
+    )
+
+    st.markdown("### Categorie + keyword")
+    categories = list(default_keywords_by_category().keys())
+    sel_cats = st.multiselect("Categorie", categories, default=["Riqualificazione urbana", "Sport"])
+    custom_kw = st.text_area(
+        "Keyword aggiuntive (una per riga, opzionale)",
+        value="affidamento progettazione\nincarico professionale\nprogetto esecutivo\nCUP\nCIG\n",
+        height=120
+    )
+
+    st.markdown("### Limiti anti-blocco (consigliato)")
+    c5, c6, c7 = st.columns([1, 1, 1])
+    with c5:
+        max_portals = st.number_input("Max portali per run", min_value=1, max_value=5000, value=30, step=1)
+    with c6:
+        max_pages = st.number_input("Max pagine per portale", min_value=1, max_value=50, value=5, step=1)
+    with c7:
+        request_timeout = st.number_input("Timeout request (sec)", min_value=3, max_value=60, value=12, step=1)
+
+    st.markdown("### Output")
+    include_pdf_parse = st.checkbox("Apri e parse PDF (pypdf) quando trovati", value=True)
+
+    st.session_state.config = {
+        "sel_reg": sel_reg,
+        "sel_ente": sel_ente,
+        "date_start": str(date_start),
+        "date_end": str(date_end),
+        "search_mode": search_mode,
+        "sel_cats": sel_cats,
+        "custom_kw": [k.strip() for k in custom_kw.splitlines() if k.strip()],
+        "max_portals": int(max_portals),
+        "max_pages": int(max_pages),
+        "request_timeout": int(request_timeout),
+        "include_pdf_parse": bool(include_pdf_parse),
+        "columns": {"region_col": region_col, "ente_col": ente_col, "url_col": url_col},
+    }
+
+    st.success("Configurazione salvata. Vai su **3) Esegui**.")
+
+# ----------------------------
+# 3) Run
+# ----------------------------
+elif section == "3) Esegui":
+    st.subheader("3) Esegui ricerca (on-demand)")
+
+    if st.session_state.master_df is None:
+        st.warning("Prima carica il MASTER_SA in **1) Dati portali**.")
+        st.stop()
+    if st.session_state.config is None:
+        st.warning("Prima configura la ricerca in **2) Configura ricerca**.")
+        st.stop()
+
+    cfg = st.session_state.config
+    st.json(cfg, expanded=False)
+
+    if st.button("Avvia ricerca", type="primary"):
+        st.session_state.results_df = pd.DataFrame()
+        st.session_state.log_lines = []
+        log("Avvio ricerca...")
+
+        master = st.session_state.master_df.copy()
+        cols = cfg["columns"]
+        region_col, ente_col, url_col = cols["region_col"], cols["ente_col"], cols["url_col"]
+
+        master_f = filter_master_sa(master, cfg["sel_reg"], cfg["sel_ente"], region_col=region_col, ente_col=ente_col)
+        if url_col is None:
+            st.error("Non trovo la colonna URL nel MASTER_SA. Rinominare una colonna in 'url' oppure 'link'.")
+            log("ERRORE: colonna url non trovata.")
+            st.stop()
+
+        master_f = master_f.dropna(subset=[url_col]).head(cfg["max_portals"])
+        log(f"Portali selezionati: {len(master_f)} (max {cfg['max_portals']})")
+
+        with st.spinner("Ricerca in corso..."):
+            progress = st.progress(0)
+            status = st.empty()
+
+            def cb(i, total, msg):
+                progress.progress(int((i / max(total, 1)) * 100))
+                status.write(msg)
+
+            results_df, meta = run_osint_search(
+                portals_df=master_f,
+                url_col=url_col,
+                region_col=region_col,
+                ente_col=ente_col,
+                date_start=cfg["date_start"],
+                date_end=cfg["date_end"],
+                categories=cfg["sel_cats"],
+                custom_keywords=cfg["custom_kw"],
+                search_mode=cfg["search_mode"],
+                include_pdf_parse=cfg["include_pdf_parse"],
+                max_pages=cfg["max_pages"],
+                request_timeout=cfg["request_timeout"],
+                features=st.session_state.get("features", {}),
+                progress_cb=cb,
+                log_cb=log,
             )
 
-        with col2:
-            combined_csv, per = create_csv_segments(data_for_export)
-            st.download_button(
-                "📋 Scarica CSV (tutti)",
-                data=combined_csv,
-                file_name="leads_all.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+        st.session_state.results_df = results_df
+        st.session_state.last_run_meta = meta
+        log("Ricerca completata.")
+        st.success(f"Completato: {len(results_df)} record trovati.")
 
-        with col3:
-            st.download_button(
-                "📋 Scarica CSV Segment A",
-                data=per.get("A", ""),
-                file_name="segment_A_premium.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+    st.divider()
+    st.subheader("Log (ultimo run)")
+    st.code("\n".join(st.session_state.log_lines[-200:]) or "Nessun log (ancora).")
+
+# ----------------------------
+# 4) Results & Export
+# ----------------------------
+elif section == "4) Risultati & Export":
+    st.subheader("4) Risultati & Export")
+
+    df = st.session_state.results_df
+    if df is None or df.empty:
+        st.info("Nessun risultato. Vai su **3) Esegui** e lancia una ricerca.")
+        st.stop()
+
+    meta = st.session_state.get("last_run_meta", {})
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        st.metric("Record", len(df))
+    with c2:
+        st.metric("Portali scansionati", meta.get("portals_scanned", 0))
+    with c3:
+        st.write(f"Periodo: **{meta.get('date_start','?')} → {meta.get('date_end','?')}**")
+
+    st.dataframe(df, use_container_width=True, height=520)
+
+    st.markdown("### Segmentazione (placeholder)")
+    seg_df = segment_leads_placeholder(df)
+    st.dataframe(seg_df, use_container_width=True)
+
+    st.markdown("### Export")
+    excel_bytes = df_to_excel_bytes(results_df=df, segments_df=seg_df, meta=meta)
+
+    st.download_button(
+        "⬇️ Scarica Excel (risultati + segmenti)",
+        data=excel_bytes,
+        file_name="ricerca_progetti_export.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.download_button(
+        "⬇️ Scarica CSV risultati",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="results.csv",
+        mime="text/csv",
+    )
+
+# ----------------------------
+# Settings / Diagnostics
+# ----------------------------
+else:
+    st.subheader("Impostazioni & Diagnostica")
+    st.write("Verifica installazione feature opzionali senza rompere l'avvio.")
+
+    checks = {}
+    for mod in ["plotly.express", "selenium", "pytesseract", "pdf2image", "anthropic", "groq"]:
+        try:
+            __import__(mod.split(".")[0])
+            checks[mod] = "OK"
+        except Exception as e:
+            checks[mod] = f"NON INSTALLATO ({type(e).__name__})"
+    st.json(checks)
+
+    st.markdown("### Performance (Streamlit Cloud)")
+    st.write(
+        "- `packages.txt` vuoto = boot rapido.\n"
+        "- Abilita OCR/Selenium solo se serve davvero.\n"
+        "- Tieni bassi: max portali / max pagine / timeout.\n"
+        "- Nessun import pesante in top-level (già sistemato)."
+    )
