@@ -995,12 +995,22 @@ def page_dataset():
 def page_search(state):
     st.header("🧭 Ricerca")
 
-    st.markdown("### Sorgenti URL")
+        st.markdown("### Sorgenti URL")
+
+    # 1) URL singolo (nuovo)
+    single_url = st.text_input(
+        "URL singolo (sito/pagina specifica)",
+        value="",
+        placeholder="https://www.comune.esempio.it/albo-pretorio",
+        help="Inserisci qui un singolo URL da analizzare. Verrà aggiunto alla lista finale degli URL da cercare."
+    )
+
     col1, col2 = st.columns([1, 1])
 
     with col1:
+        # 2) Lista URL (multilinea)
         urls_text = st.text_area(
-            "Incolla uno o più URL (uno per riga)",
+            "Oppure incolla più URL (uno per riga)",
             value="",
             height=120,
             placeholder="https://www.comune.esempio.it/albo-pretorio\nhttps://www....",
@@ -1013,6 +1023,7 @@ def page_search(state):
         )
 
     with col2:
+        # 3) Dataset (opzionale)
         use_dataset = st.checkbox("Usa anche URL dal dataset caricato", value=False)
         limit_urls = st.number_input("Max URL dal dataset", 1, 5000, 200, 50)
 
@@ -1026,14 +1037,27 @@ def page_search(state):
                 dataset_info = "Dataset caricato ma colonna URL non selezionata."
         st.write(dataset_info)
 
+    # ===== costruzione lista URL finale =====
     urls: List[str] = []
+
+    # a) aggiungi URL singolo
+    if single_url.strip():
+        u = normalize_url(single_url)
+        if u:
+            urls.append(u)
+
+    # b) aggiungi URL multilinea
     if urls_text.strip():
         for line in urls_text.splitlines():
             u = normalize_url(line)
             if u:
                 urls.append(u)
 
-    # Add dataset URLs (with real region filter if column exists)
+    # dedup immediato (preserva ordine)
+    seen = set()
+    urls = [u for u in urls if not (u in seen or seen.add(u))]
+
+    # c) aggiungi URL da dataset (con filtro regione reale se colonna presente)
     region_selected = state["region"]
     if use_dataset and "dataset_df" in st.session_state:
         df = st.session_state["dataset_df"].copy()
@@ -1047,7 +1071,7 @@ def page_search(state):
         if url_col and url_col in df.columns:
             from_ds = [normalize_url(x) for x in df[url_col].dropna().astype(str).tolist()]
             from_ds = [x for x in from_ds if x]
-            seen = set(urls)
+            # append mantenendo dedup
             for u in from_ds:
                 if u not in seen:
                     seen.add(u)
@@ -1056,9 +1080,6 @@ def page_search(state):
         else:
             st.warning("Dataset attivo ma colonna URL non selezionata in Dataset.")
 
-    if not urls:
-        st.info("Inserisci almeno 1 URL (o carica un dataset e seleziona la colonna URL).")
-        return
 
     terms = compile_terms(state["category"], extra_terms, state["status"], state["phase"], state["region"])
 
