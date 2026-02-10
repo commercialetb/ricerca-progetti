@@ -1,873 +1,662 @@
-# app.py — Streamlit Cloud safe:
-# - Lazy loading
-# - Light scraping (requests/bs4)
-# - Optional Selenium mode (toggle)
-# - Optional PDF parsing w/ pypdf (toggle)
-# - True date filters (from PDF when available)
-# - Dropdown filters for category / status / phase
-# - Progress + ETA
+# app.py
+# Ricerca Progetti Italia – Streamlit (lite + toggles)
+# Avvio rapido su Streamlit Cloud, caricamenti opzionali, ricerca URL + dataset, progress/ETA.
 
-import time
+from __future__ import annotations
+
+import io
 import re
+import time
+import math
 from dataclasses import dataclass
-from datetime import datetime, date
-from typing import List, Dict, Tuple, Optional
-from urllib.parse import urljoin
+from typing import List, Dict, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
-import streamlit as st
 import pandas as pd
 import requests
+import streamlit as st
 from bs4 import BeautifulSoup
 
 
-# -----------------------------
+# ----------------------------
 # Config
-# -----------------------------
-APP_TITLE = "Ricerca Progetti"
-DEFAULT_TIMEOUT = 20
+# ----------------------------
+st.set_page_config(page_title="Ricerca Progetti Italia (Lite)", page_icon="🔎", layout="wide")
 
-PDF_RE = re.compile(r"\.pdf(\?|$)", re.IGNORECASE)
+DEFAULT_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
 
-# Date patterns in Italian docs
-DATE_PATTERNS = [
-    re.compile(r"\b(\d{2})[\/\-.](\d{2})[\/\-.](\d{4})\b"),  # dd/mm/yyyy
-    re.compile(r"\b(\d{4})[\/\-.](\d{2})[\/\-.](\d{2})\b"),  # yyyy-mm-dd
-]
-
-# Limit PDF download to avoid timeouts / huge files
-PDF_MAX_MB_DEFAULT = 10
-
-st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="wide")
-
-
-# -----------------------------
-# Taxonomy (dropdown -> keywords)
-# -----------------------------
-CATEGORIES = [
-    "Tutte",
-    "Sport e impianti sportivi",
-    "Piste ciclabili e mobilità dolce",
-    "Progetti aeroportuali",
-    "Centri commerciali",
-    "Progetti alberghieri",
-    "Edilizia residenziale pubblica",
-    "Strutture sanitarie",
-    "Università e ricerca",
-    "Innovazione e startup",
-    "Archivi e patrimonio culturale",
-    "Musei e spazi culturali",
-    "Intrattenimento e spettacolo",
-    "Trasporto pubblico locale",
-    "Edilizia giudiziaria e sicurezza",
-    "Sistemazioni urbane",
-]
-
-CATEGORY_KEYWORDS = {
-    "Sport e impianti sportivi": [
-        "impianto sportivo", "palazzetto", "palestra", "piscina", "stadio", "campo sportivo", "palasport"
+CATEGORIES: Dict[str, List[str]] = {
+    "Sport e impianti sportivi (impianti, piscine, palestre, palazzetti)": [
+        "impianto sportivo", "stadio", "palazzetto", "palestra", "piscina",
+        "polisportivo", "campo", "centro sportivo",
     ],
-    "Piste ciclabili e mobilità dolce": [
-        "pista ciclabile", "ciclovia", "percorso ciclopedonale", "ciclo-pedonale", "mobilità dolce", "bike sharing"
+    "Piste ciclabili e mobilità dolce (piste ciclabili, ciclovie, percorsi ciclo-pedonali)": [
+        "pista ciclabile", "ciclovia", "ciclopedonale", "greenway",
+        "mobilità dolce", "percorso ciclabile", "percorso ciclo pedonale",
     ],
-    "Progetti aeroportuali": ["aeroporto", "aerostazione", "terminal", "pista di volo", "airside", "landside"],
+    "Progetti aeroportuali": ["aeroporto", "aerostazione", "terminal", "hangar", "airside", "landside"],
     "Centri commerciali": ["centro commerciale", "mall", "galleria commerciale", "retail park", "ipermercato"],
-    "Progetti alberghieri": ["hotel", "albergo", "resort", "ospitalità", "ricettivo", "struttura ricettiva"],
-    "Edilizia residenziale pubblica": ["erp", "edilizia residenziale pubblica", "housing", "rigenerazione urbana", "ristrutturazione alloggi"],
-    "Strutture sanitarie": ["ospedale", "poliambulatorio", "rsa", "residenza sanitaria", "laboratorio", "fisioterapia", "ambulatorio"],
-    "Università e ricerca": ["università", "campus", "laboratorio", "biblioteca", "residenza universitaria", "ricerca"],
-    "Innovazione e startup": ["hub", "incubatore", "fab lab", "fablab", "maker space", "makerspace", "coworking", "startup"],
-    "Archivi e patrimonio culturale": ["archivio", "restauro", "patrimonio culturale", "biblioteca", "catalogazione"],
-    "Musei e spazi culturali": ["museo", "galleria", "centro culturale", "spazio culturale", "mostra"],
-    "Intrattenimento e spettacolo": ["teatro", "cinema", "auditorium", "anfiteatro", "concerti", "spazio eventi"],
-    "Trasporto pubblico locale": ["tram", "metro", "metropolitana", "autobus", "bus elettrici", "stazione", "deposito", "tpl"],
-    "Edilizia giudiziaria e sicurezza": ["tribunale", "carcere", "questura", "caserma", "sicurezza", "prefettura"],
-    "Sistemazioni urbane": ["riqualificazione urbana", "piazza", "strada", "parco", "arredo urbano", "sistemazione urbana"],
+    "Progetti alberghieri": ["hotel", "albergo", "resort", "struttura ricettiva", "ospitalità"],
+    "Edilizia residenziale pubblica (ERP, housing, rigenerazione urbana, ristrutturazioni)": [
+        "ERP", "edilizia residenziale pubblica", "housing", "social housing",
+        "rigenerazione urbana", "ristrutturazione", "case popolari",
+    ],
+    "Strutture sanitarie (ospedali, poliambulatori, RSA, laboratori, fisioterapia)": [
+        "ospedale", "poliambulatorio", "RSA", "laboratorio", "fisioterapia",
+        "struttura sanitaria", "ambulatorio",
+    ],
+    "Università e ricerca (campus, laboratori, biblioteche, residenze)": [
+        "campus", "laboratorio", "biblioteca", "residenza universitaria", "dipartimento",
+    ],
+    "Innovazione e startup (hub, incubatori, fab lab, maker space)": [
+        "hub", "incubatore", "fab lab", "maker space", "acceleratore", "innovation",
+    ],
+    "Archivi e patrimonio culturale (archivi, biblioteche, musei, restauro)": [
+        "archivio", "deposito", "biblioteca", "museo", "restauro", "patrimonio culturale",
+    ],
+    "Musei e spazi culturali (musei civici, gallerie, centri culturali)": [
+        "museo", "musei civici", "galleria", "spazio culturale", "centro culturale",
+    ],
+    "Intrattenimento e spettacolo (teatri, cinema, auditorium, anfiteatri, spazi concerti)": [
+        "teatro", "cinema", "auditorium", "anfiteatro", "spazio concerti", "arena",
+    ],
+    "Trasporto pubblico locale (tram, autobus, metro, bus elettrici, stazioni, bike sharing)": [
+        "tram", "autobus", "metro", "bus elettrici", "stazione", "bike sharing", "deposito bus",
+    ],
+    "Edilizia giudiziaria e sicurezza (tribunali, carceri, questure, caserme)": [
+        "tribunale", "carcere", "questura", "caserma", "comando",
+    ],
+    "Sistemazioni urbane (riqualificazione urbana, piazze, strade, parchi, arredo urbano)": [
+        "riqualificazione urbana", "piazza", "strada", "parco", "arredo urbano", "sistemazione urbana",
+    ],
 }
 
-STATI = ["Tutti", "progetto PFTE", "progetto definitivo", "progetto esecutivo"]
-STATO_KEYWORDS = {
-    "progetto PFTE": ["pfte", "fattibilità tecnico-economica", "fattibilita tecnico economica", "studio di fattibilità"],
-    "progetto definitivo": ["progetto definitivo"],
-    "progetto esecutivo": ["progetto esecutivo"],
-}
+PROJECT_STATUS = ["(qualsiasi)", "progetto PFTE", "progetto definitivo", "progetto esecutivo"]
+PROJECT_PHASE = ["(qualsiasi)", "FASE DI PROGRAMMAZIONE", "FASE DI PROGETTAZIONE", "FASE DI ESECUZIONE"]
 
-FASI = ["Tutte", "FASE DI PROGRAMMAZIONE", "FASE DI PROGETTAZIONE", "FASE DI ESECUZIONE"]
-FASE_KEYWORDS = {
-    "FASE DI PROGRAMMAZIONE": ["programmazione", "piano triennale", "programma", "inserimento in elenco", "cup", "opere pubbliche"],
-    "FASE DI PROGETTAZIONE": ["progettazione", "affidamento progettazione", "incarico progettazione", "progetto", "pfte", "definitivo", "esecutivo"],
-    "FASE DI ESECUZIONE": ["esecuzione", "lavori", "cantiere", "direzione lavori", "consegna lavori", "stato avanzamento", "sal"],
-}
+DATE_RE = re.compile(r"\b(?:(?:0?[1-9]|[12]\d|3[01])[-/\.](?:0?[1-9]|1[0-2])[-/\.](?:19|20)\d{2})\b")
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def seconds_to_hhmmss(s: float) -> str:
-    s = max(0, int(s))
-    h = s // 3600
-    m = (s % 3600) // 60
-    sec = s % 60
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{sec:02d}"
-    return f"{m:02d}:{sec:02d}"
+# ----------------------------
+# Models
+# ----------------------------
+@dataclass
+class SearchResult:
+    source_url: str
+    found_url: str
+    title: str
+    matched_terms: List[str]
+    doc_date: Optional[str] = None
+    emails: Optional[List[str]] = None
+    note: str = ""
 
 
-def _safe_read_csv(uploaded_file) -> Tuple[Optional[pd.DataFrame], List[str]]:
-    warnings = []
-    try:
-        df = pd.read_csv(
-            uploaded_file,
-            engine="python",
-            sep=None,
-            on_bad_lines="warn",
-            dtype=str,
-        )
-        df.columns = [c.strip() for c in df.columns]
-        return df, warnings
-    except Exception as e:
-        return None, [f"Errore lettura CSV: {e}"]
+# ----------------------------
+# Network helpers
+# ----------------------------
+def safe_get(url: str, timeout: int = 25) -> requests.Response:
+    headers = {"User-Agent": DEFAULT_UA, "Accept-Language": "it-IT,it;q=0.9,en;q=0.8"}
+    resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+    resp.raise_for_status()
+    return resp
 
 
-def normalize_targets_df(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    warnings = []
-    df = df.copy()
-
-    url_col = None
-    for candidate in ["ALBO_PRETORIO_URL", "URL", "PORTAL_URL", "LINK"]:
-        if candidate in df.columns:
-            url_col = candidate
-            break
-
-    if not url_col:
-        return df, ["CSV senza colonna URL. Serve ALBO_PRETORIO_URL oppure URL."]
-
-    if url_col != "ALBO_PRETORIO_URL":
-        df.rename(columns={url_col: "ALBO_PRETORIO_URL"}, inplace=True)
-
-    for c in ["COMUNE", "PROVINCIA", "REGIONE"]:
-        if c not in df.columns:
-            df[c] = ""
-
-    df["ALBO_PRETORIO_URL"] = df["ALBO_PRETORIO_URL"].fillna("").astype(str).str.strip()
-    df = df[df["ALBO_PRETORIO_URL"] != ""].reset_index(drop=True)
-
-    if len(df) == 0:
-        warnings.append("Nessun URL valido trovato nel CSV.")
-
-    return df, warnings
+def normalize_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    return u
 
 
-def add_custom_url(df: pd.DataFrame, url: str, comune: str = "", provincia: str = "", regione: str = "") -> pd.DataFrame:
-    url = (url or "").strip()
-    if not url:
-        return df
-    if not (url.startswith("http://") or url.startswith("https://")):
-        url = "https://" + url
-    if "ALBO_PRETORIO_URL" in df.columns and (df["ALBO_PRETORIO_URL"] == url).any():
-        return df
-    new_row = {
-        "COMUNE": comune or "CUSTOM",
-        "PROVINCIA": provincia or "",
-        "REGIONE": regione or "",
-        "ALBO_PRETORIO_URL": url
-    }
-    return pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-
-
-def fetch_html(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Optional[str]]:
-    try:
-        r = requests.get(
-            url,
-            timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; StreamlitBot/1.0)"},
-            allow_redirects=True,
-        )
-        if r.status_code >= 400:
-            return None, f"HTTP {r.status_code}"
-        return r.text, None
-    except Exception as e:
-        return None, str(e)
-
-
-def extract_pdf_items_from_html(base_url: str, html: str, max_items: int = 400) -> List[Dict[str, str]]:
+def guess_text_from_html(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
-    out = []
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    return " ".join(soup.get_text(" ").split())
+
+
+def extract_links(base_url: str, html: str) -> List[str]:
+    soup = BeautifulSoup(html, "lxml")
+    links = []
     for a in soup.find_all("a", href=True):
-        href = (a.get("href") or "").strip()
+        href = a.get("href")
         if not href:
             continue
         full = urljoin(base_url, href)
-        if not PDF_RE.search(full):
+        if full.startswith(("mailto:", "javascript:")):
             continue
-        anchor_text = " ".join((a.get_text(" ", strip=True) or "").split())
-        # context snippet: try parent text
-        parent_text = ""
-        try:
-            parent_text = " ".join((a.parent.get_text(" ", strip=True) or "").split())
-        except Exception:
-            parent_text = ""
-        out.append({
-            "pdf_url": full,
-            "anchor_text": anchor_text,
-            "context": parent_text[:500]
-        })
-        if len(out) >= max_items:
+        links.append(full)
+    # de-dup preserving order
+    seen, out = set(), []
+    for x in links:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def is_probably_pdf(url: str) -> bool:
+    return urlparse(url).path.lower().endswith(".pdf")
+
+
+# ----------------------------
+# Search helpers
+# ----------------------------
+def compile_terms(category: str, extra_terms: str, status: str, phase: str) -> List[str]:
+    terms: List[str] = []
+    if category and category != "(qualsiasi)":
+        terms.extend(CATEGORIES.get(category, []))
+    if status and status != "(qualsiasi)":
+        terms.append(status)
+    if phase and phase != "(qualsiasi)":
+        terms.append(phase)
+    if extra_terms:
+        for t in re.split(r"[,\n;]+", extra_terms):
+            t = t.strip()
+            if t:
+                terms.append(t)
+    # unique (keep order)
+    seen, cleaned = set(), []
+    for t in terms:
+        k = t.lower()
+        if k not in seen:
+            seen.add(k)
+            cleaned.append(t)
+    return cleaned
+
+
+def find_matches(text: str, terms: List[str]) -> List[str]:
+    low = text.lower()
+    return [t for t in terms if t.lower() in low]
+
+
+def parse_date_from_text(text: str) -> Optional[str]:
+    m = DATE_RE.search(text)
+    return m.group(0) if m else None
+
+
+def in_date_range(date_str: Optional[str], start, end) -> bool:
+    """Filtri veri se la data è trovata; se non è trovata non escludiamo (ma resta DOC_DATE vuota)."""
+    if not start and not end:
+        return True
+    if not date_str:
+        return True
+    d = None
+    for sep in ("/", "-", "."):
+        if sep in date_str:
+            p = date_str.split(sep)
+            if len(p) == 3:
+                try:
+                    import datetime as _dt
+                    d = _dt.date(int(p[2]), int(p[1]), int(p[0]))
+                except Exception:
+                    d = None
             break
-
-    # dedup by pdf_url preserving order
-    seen = set()
-    dedup = []
-    for x in out:
-        if x["pdf_url"] not in seen:
-            seen.add(x["pdf_url"])
-            dedup.append(x)
-    return dedup
+    if not d:
+        return True
+    if start and d < start:
+        return False
+    if end and d > end:
+        return False
+    return True
 
 
-def keyword_match_score(text: str, keywords: List[str]) -> int:
-    if not text:
-        return 0
-    t = text.lower()
-    score = 0
-    for kw in keywords:
-        if kw.lower() in t:
-            score += 1
-    return score
-
-
-def choose_filters_keywords(category: str, stato: str, fase: str) -> Tuple[List[str], List[str], List[str]]:
-    cat_k = CATEGORY_KEYWORDS.get(category, []) if category and category != "Tutte" else []
-    stato_k = STATO_KEYWORDS.get(stato, []) if stato and stato != "Tutti" else []
-    fase_k = FASE_KEYWORDS.get(fase, []) if fase and fase != "Tutte" else []
-    return cat_k, stato_k, fase_k
-
-
-def parse_date_from_text(text: str) -> Optional[date]:
-    if not text:
-        return None
-    # find all candidate dates
-    candidates: List[date] = []
-    for pat in DATE_PATTERNS:
-        for m in pat.finditer(text):
-            try:
-                if len(m.groups()) == 3:
-                    g = m.groups()
-                    # dd/mm/yyyy
-                    if len(g[0]) == 2 and len(g[2]) == 4 and pat.pattern.startswith(r"\b(\d{2})"):
-                        d = date(int(g[2]), int(g[1]), int(g[0]))
-                    else:
-                        # yyyy-mm-dd
-                        d = date(int(g[0]), int(g[1]), int(g[2]))
-                    candidates.append(d)
-            except Exception:
-                continue
-    if not candidates:
-        return None
-    # heuristic: pick the most recent (often publication date is recent)
-    candidates.sort()
-    return candidates[-1]
-
-
-def download_pdf_bytes(url: str, timeout: int, max_mb: int) -> Tuple[Optional[bytes], str]:
+def pdf_extract_text_and_meta(url: str, max_bytes: int = 12_000_000):
+    """Usa pypdf SOLO se il toggle è ON e la lib è installata."""
+    note = ""
     try:
-        with requests.get(
-            url,
-            timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; StreamlitBot/1.0)"},
-            stream=True,
-            allow_redirects=True,
-        ) as r:
-            if r.status_code >= 400:
-                return None, f"HTTP {r.status_code}"
-            total = 0
-            chunks = []
-            limit = max_mb * 1024 * 1024
-            for chunk in r.iter_content(chunk_size=1024 * 256):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > limit:
-                    return None, f"PDF oltre limite ({max_mb}MB)"
-                chunks.append(chunk)
-            return b"".join(chunks), ""
-    except Exception as e:
-        return None, str(e)
+        resp = safe_get(url, timeout=35)
+        content = resp.content
+        if len(content) > max_bytes:
+            return "", None, [], f"PDF troppo grande ({len(content)/1e6:.1f} MB), skip parsing"
 
-
-def parse_pdf_text_and_date(pdf_bytes: bytes) -> Tuple[str, Optional[date], str]:
-    """
-    Returns: (text_snippet, doc_date, error)
-    """
-    try:
         from pypdf import PdfReader  # lazy import
-    except Exception as e:
-        return "", None, f"pypdf non disponibile: {e}"
+        reader = PdfReader(io.BytesIO(content))
 
-    try:
-        reader = PdfReader(io_bytes := _BytesIO(pdf_bytes))
-        meta_date = None
-
-        # metadata
-        try:
-            md = reader.metadata
-            # common fields: /CreationDate, /ModDate
-            for k in ["/ModDate", "/CreationDate"]:
-                v = getattr(md, k, None) if md else None
-                if not v and md and k in md:
-                    v = md.get(k)
-                if isinstance(v, str) and len(v) >= 8:
-                    # pdf date often like D:20240131120000
-                    m = re.search(r"(\d{4})(\d{2})(\d{2})", v)
-                    if m:
-                        meta_date = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                        break
-        except Exception:
-            pass
-
-        # extract text (first N pages)
-        texts = []
-        max_pages = min(3, len(reader.pages))
-        for i in range(max_pages):
+        parts = []
+        for page in reader.pages[:6]:  # prime 6 pagine
             try:
-                t = reader.pages[i].extract_text() or ""
-                if t.strip():
-                    texts.append(t)
+                parts.append(page.extract_text() or "")
             except Exception:
                 continue
+        text = "\n".join(parts)
+        date_str = parse_date_from_text(text)
+        emails = sorted(set(EMAIL_RE.findall(text)))
+        return text, date_str, emails, note
 
-        full_text = "\n".join(texts).strip()
-        snippet = full_text[:4000]
-
-        text_date = parse_date_from_text(full_text)
-
-        # choose best: prefer text_date (often “data” in doc), else metadata
-        doc_date = text_date or meta_date
-
-        return snippet, doc_date, ""
+    except ModuleNotFoundError:
+        return "", None, [], "pypdf non installato"
     except Exception as e:
-        return "", None, str(e)
+        return "", None, [], f"Errore parsing PDF: {e}"
 
 
-class _BytesIO:
-    """Tiny BytesIO replacement (no import) to keep surface minimal."""
-    def __init__(self, b: bytes):
-        self._b = b
-        self._i = 0
+def selenium_fetch_html(url: str, wait_s: int = 6) -> str:
+    """Usa Selenium SOLO se toggle ON e selenium/chromium disponibili."""
+    from selenium import webdriver  # lazy
+    from selenium.webdriver.chrome.options import Options
 
-    def read(self, n: int = -1) -> bytes:
-        if n == -1:
-            n = len(self._b) - self._i
-        out = self._b[self._i:self._i + n]
-        self._i += n
-        return out
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,1024")
+    options.add_argument(f"--user-agent={DEFAULT_UA}")
 
-    def seek(self, i: int, whence: int = 0):
-        if whence == 0:
-            self._i = i
-        elif whence == 1:
-            self._i += i
-        else:
-            self._i = len(self._b) + i
-
-    def tell(self):
-        return self._i
-
-
-@dataclass
-class PortalResult:
-    comune: str
-    provincia: str
-    regione: str
-    portal_url: str
-    error: str
-    items: List[Dict]  # pdf items + optional parsed data
-
-
-def selenium_collect_pdf_items(url: str, timeout: int, max_items: int = 400) -> Tuple[List[Dict[str, str]], str]:
-    """
-    Selenium mode: loads page in headless chromium and extracts PDF links.
-    Lazy import so it won't break app startup.
-    """
+    driver = webdriver.Chrome(options=options)
     try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-    except Exception as e:
-        return [], f"Selenium non disponibile: {e}"
-
-    try:
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(timeout)
         driver.get(url)
-        time.sleep(1.2)
-
-        html = driver.page_source
-        driver.quit()
-
-        return extract_pdf_items_from_html(url, html, max_items=max_items), ""
-    except Exception as e:
+        time.sleep(max(1, wait_s))
+        return driver.page_source or ""
+    finally:
         try:
             driver.quit()
         except Exception:
             pass
-        return [], str(e)
 
 
-def run_scrape(
-    targets: List[Dict[str, str]],
-    max_pages_per_portal: int,
-    max_pdf_per_portal: int,
-    timeout: int,
-    use_selenium: bool,
-    parse_pdf: bool,
-    pdf_max_mb: int,
-    date_start: Optional[date],
-    date_end: Optional[date],
-    include_no_date: bool,
-    category: str,
-    stato: str,
-    fase: str,
-    progress_cb=None,
-    stop_flag_cb=None,
-) -> List[Dict]:
-    results: List[Dict] = []
-    t0 = time.time()
-    per_portal_times = []
-
-    cat_k, stato_k, fase_k = choose_filters_keywords(category, stato, fase)
-
-    for i, t in enumerate(targets, start=1):
-        if stop_flag_cb and stop_flag_cb():
-            break
-
-        portal_url = (t.get("ALBO_PRETORIO_URL") or "").strip()
-        comune = (t.get("COMUNE") or "").strip()
-        provincia = (t.get("PROVINCIA") or "").strip()
-        regione = (t.get("REGIONE") or "").strip()
-
-        portal_start = time.time()
-        err = ""
-        items: List[Dict] = []
-
-        # Candidate pages (light pagination heuristic)
-        candidate_urls = [portal_url]
-        if max_pages_per_portal > 1:
-            for p in range(2, max_pages_per_portal + 1):
-                if "?" in portal_url:
-                    candidate_urls.append(f"{portal_url}&page={p}")
-                else:
-                    candidate_urls.append(f"{portal_url}?page={p}")
-
-        # Selenium: typically only first page (avoid heavy loops)
+def fetch_html(url: str, use_selenium: bool):
+    try:
         if use_selenium:
-            collected, e = selenium_collect_pdf_items(portal_url, timeout=timeout, max_items=max_pdf_per_portal)
-            if e:
-                err = e
-            items = collected[:max_pdf_per_portal]
+            return selenium_fetch_html(url, wait_s=6), "selenium"
+        r = safe_get(url, timeout=25)
+        return r.text, "requests"
+    except ModuleNotFoundError:
+        return "", "selenium non installato"
+    except Exception as e:
+        return "", f"fetch error: {e}"
+
+
+@st.cache_data(show_spinner=False)
+def load_csv_robust_from_bytes(raw: bytes) -> Tuple[pd.DataFrame, List[str]]:
+    warnings: List[str] = []
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+        return df, warnings
+    except Exception:
+        df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", on_bad_lines="skip")
+        warnings.append("CSV letto in modalità robusta (sep auto + skip righe malformate).")
+        return df, warnings
+
+
+@st.cache_data(show_spinner=False)
+def load_csv_robust(path_or_url: str) -> Tuple[pd.DataFrame, List[str]]:
+    warnings: List[str] = []
+    if not path_or_url:
+        return pd.DataFrame(), ["Percorso/URL CSV vuoto"]
+    try:
+        if path_or_url.startswith(("http://", "https://")):
+            raw = safe_get(path_or_url, timeout=30).content
         else:
-            all_items = []
-            for u in candidate_urls:
-                if stop_flag_cb and stop_flag_cb():
-                    break
-                html, e = fetch_html(u, timeout=timeout)
-                if e:
-                    err = e
+            with open(path_or_url, "rb") as f:
+                raw = f.read()
+        return load_csv_robust_from_bytes(raw)
+    except Exception as e:
+        return pd.DataFrame(), [f"Errore caricamento CSV: {e}"]
+
+
+def show_working_indicator(step_text: str, progress: float, eta_s):
+    cols = st.columns([2, 1])
+    with cols[0]:
+        st.info(f"⏳ In lavorazione: {step_text}")
+        st.progress(min(max(progress, 0.0), 1.0))
+    with cols[1]:
+        st.metric("ETA stimata", f"{int(max(0, eta_s))} s" if eta_s is not None and math.isfinite(eta_s) else "—")
+
+
+def crawl_url(
+    start_url: str,
+    terms: List[str],
+    use_selenium: bool,
+    parse_pdf_toggle: bool,
+    start_date,
+    end_date,
+    max_results: int,
+    max_depth: int,
+    status_box=None
+) -> List[SearchResult]:
+    start_url = normalize_url(start_url)
+    if not start_url:
+        return []
+
+    domain = urlparse(start_url).netloc
+    visited = set()
+    queue: List[Tuple[str, int]] = [(start_url, 0)]
+    results: List[SearchResult] = []
+
+    t0 = time.time()
+    processed = 0
+    rough_total = 1 + (max_depth * 25)
+
+    while queue and len(results) < max_results:
+        url, depth = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        processed += 1
+
+        # progress + ETA locale (per singolo URL)
+        elapsed = time.time() - t0
+        rate = processed / elapsed if elapsed > 0 else 0.0
+        remaining = max(0, rough_total - processed)
+        eta = remaining / rate if rate > 0 else None
+
+        if status_box is not None:
+            with status_box:
+                show_working_indicator(f"{urlparse(url).netloc} · depth {depth}", processed / max(rough_total, 1), eta)
+
+        # PDF
+        if is_probably_pdf(url):
+            title = url.split("/")[-1]
+            matched_terms: List[str] = []
+            doc_date, emails, note = None, [], ""
+
+            if parse_pdf_toggle:
+                text, doc_date, emails, note = pdf_extract_text_and_meta(url)
+                if text:
+                    matched_terms = find_matches(text, terms)
+
+            if (not terms) or matched_terms:
+                if in_date_range(doc_date, start_date, end_date):
+                    results.append(SearchResult(start_url, url, title, matched_terms, doc_date, emails, note))
+            continue
+
+        # HTML
+        html, fetch_note = fetch_html(url, use_selenium)
+        if not html:
+            continue
+
+        text = guess_text_from_html(html)
+        matched = find_matches(text, terms) if terms else []
+
+        if (not terms) or matched:
+            doc_date = parse_date_from_text(text)
+            if in_date_range(doc_date, start_date, end_date):
+                results.append(
+                    SearchResult(
+                        start_url,
+                        url,
+                        (text[:90] + "…") if len(text) > 90 else (text[:90] or url),
+                        matched,
+                        doc_date,
+                        sorted(set(EMAIL_RE.findall(text)))[:20],
+                        f"html({fetch_note})",
+                    )
+                )
+
+        # Expand links (same domain only)
+        if depth < max_depth and len(results) < max_results:
+            links = extract_links(url, html)
+            for lk in links[:150]:
+                try:
+                    if urlparse(lk).netloc and urlparse(lk).netloc != domain:
+                        continue
+                except Exception:
                     continue
-                all_items.extend(extract_pdf_items_from_html(u, html, max_items=max_pdf_per_portal))
-
-                if len(all_items) >= max_pdf_per_portal:
-                    break
-
-            # dedup and cap
-            seen = set()
-            dedup = []
-            for x in all_items:
-                if x["pdf_url"] not in seen:
-                    seen.add(x["pdf_url"])
-                    dedup.append(x)
-            items = dedup[:max_pdf_per_portal]
-
-        # Apply keyword filters (pre-PDF parsing using anchor/context)
-        filtered_items = []
-        for it in items:
-            blob = f"{it.get('anchor_text','')}\n{it.get('context','')}".strip()
-            score_cat = keyword_match_score(blob, cat_k) if cat_k else 1
-            score_stato = keyword_match_score(blob, stato_k) if stato_k else 1
-            score_fase = keyword_match_score(blob, fase_k) if fase_k else 1
-
-            if (cat_k and score_cat == 0) or (stato_k and score_stato == 0) or (fase_k and score_fase == 0):
-                continue
-
-            it["_score_cat"] = score_cat
-            it["_score_stato"] = score_stato
-            it["_score_fase"] = score_fase
-            filtered_items.append(it)
-
-        # Optional PDF parsing (adds: pdf_text_snippet, doc_date, pdf_error)
-        final_items = []
-        for it in filtered_items:
-            if stop_flag_cb and stop_flag_cb():
-                break
-
-            if parse_pdf:
-                pdf_bytes, dl_err = download_pdf_bytes(it["pdf_url"], timeout=timeout, max_mb=pdf_max_mb)
-                if dl_err:
-                    it["pdf_error"] = dl_err
-                    it["pdf_text_snippet"] = ""
-                    it["doc_date"] = None
-                else:
-                    snippet, doc_dt, pe = parse_pdf_text_and_date(pdf_bytes)
-                    it["pdf_text_snippet"] = snippet
-                    it["doc_date"] = doc_dt
-                    it["pdf_error"] = pe
-            else:
-                it["pdf_text_snippet"] = ""
-                it["doc_date"] = None
-                it["pdf_error"] = ""
-
-            # Date filter (true) based on doc_date
-            doc_dt = it.get("doc_date")
-            if doc_dt is None:
-                if not include_no_date and (date_start or date_end):
-                    continue
-            else:
-                if date_start and doc_dt < date_start:
-                    continue
-                if date_end and doc_dt > date_end:
-                    continue
-
-            # Post-PDF keyword filter (more accurate if parsing enabled)
-            if parse_pdf and (cat_k or stato_k or fase_k):
-                text_blob = (it.get("pdf_text_snippet") or "").lower()
-                if cat_k and keyword_match_score(text_blob, cat_k) == 0:
-                    continue
-                if stato_k and keyword_match_score(text_blob, stato_k) == 0:
-                    continue
-                if fase_k and keyword_match_score(text_blob, fase_k) == 0:
-                    continue
-
-            final_items.append(it)
-
-        pr = PortalResult(
-            comune=comune,
-            provincia=provincia,
-            regione=regione,
-            portal_url=portal_url,
-            error=err,
-            items=final_items,
-        )
-
-        results.append({
-            "comune": pr.comune,
-            "provincia": pr.provincia,
-            "regione": pr.regione,
-            "portal_url": pr.portal_url,
-            "error": pr.error,
-            "n_items": len(pr.items),
-            "items": pr.items,
-        })
-
-        portal_time = time.time() - portal_start
-        per_portal_times.append(portal_time)
-
-        if progress_cb:
-            elapsed = time.time() - t0
-            avg = sum(per_portal_times) / max(1, len(per_portal_times))
-            remaining = (len(targets) - i) * avg
-            progress_cb(i, len(targets), elapsed, remaining, pr)
+                if lk not in visited:
+                    queue.append((lk, depth + 1))
 
     return results
 
 
-# -----------------------------
-# Session state
-# -----------------------------
-if "targets_df" not in st.session_state:
-    st.session_state["targets_df"] = None
-if "raw_results" not in st.session_state:
-    st.session_state["raw_results"] = None
-if "stop" not in st.session_state:
-    st.session_state["stop"] = False
+# ----------------------------
+# UI
+# ----------------------------
+def sidebar_controls():
+    st.sidebar.header("⚙️ Menu & filtri")
+    nav = st.sidebar.radio("Menu", ["Home", "Dataset", "Ricerca"], index=0)
 
-# feature toggles (default off to avoid heavy startup)
-st.session_state.setdefault("enable_selenium_mode", False)
-st.session_state.setdefault("enable_pdf_parsing", False)
+    st.sidebar.divider()
+    st.sidebar.subheader("Opzioni (attivabili)")
+    use_selenium = st.sidebar.toggle("Modalità Selenium", value=False, help="Usa Selenium solo se requests viene bloccato.")
+    parse_pdf = st.sidebar.toggle("Parsing PDF (pypdf)", value=False, help="Scarica e analizza PDF: più lento.")
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Tipi progetto")
+    category = st.sidebar.selectbox("Categoria", ["(qualsiasi)"] + list(CATEGORIES.keys()), index=1)
+
+    st.sidebar.subheader("Stato e fase")
+    status = st.sidebar.selectbox("Stato del progetto", PROJECT_STATUS, index=0)
+    phase = st.sidebar.selectbox("Fase", PROJECT_PHASE, index=0)
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Filtro date (se disponibile)")
+    c1, c2 = st.sidebar.columns(2)
+    start = c1.date_input("data_inizio", value=None)
+    end = c2.date_input("data_fine", value=None)
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Prestazioni")
+    max_results = st.sidebar.slider("Max risultati", 10, 250, 60, 10)
+    max_depth = st.sidebar.slider("Profondità link HTML", 0, 2, 1, 1, help="0=solo pagina, 1=anche link, 2=più lento")
+
+    return {
+        "nav": nav,
+        "use_selenium": use_selenium,
+        "parse_pdf": parse_pdf,
+        "category": category,
+        "status": status,
+        "phase": phase,
+        "start_date": start if hasattr(start, "year") else None,
+        "end_date": end if hasattr(end, "year") else None,
+        "max_results": int(max_results),
+        "max_depth": int(max_depth),
+    }
 
 
-# -----------------------------
-# Sidebar + Router
-# -----------------------------
-st.title(APP_TITLE)
-st.caption("Avvio stabile su Streamlit Cloud: carica e avvia solo ciò che selezioni dal menu.")
-
-page = st.sidebar.radio(
-    "📌 Menu",
-    ["📂 Dataset", "🕷️ Ricerca", "📊 Risultati", "⚙️ Impostazioni"],
-    index=0
-)
-
-st.sidebar.markdown("---")
-st.sidebar.write("Stato:")
-if st.session_state.get("raw_results") is not None:
-    st.sidebar.success(f"Risultati presenti: {len(st.session_state['raw_results'])} portali")
-else:
-    st.sidebar.info("Nessuna ricerca avviata")
+def page_home():
+    st.title("🔎 Ricerca Progetti Italia – Streamlit (Lite)")
+    st.write(
+        "Versione stabile per Streamlit Cloud: evita loop di caricamento e rende opzionali Selenium/PDF.\n\n"
+        "Usa il menu a sinistra per scegliere cosa fare."
+    )
+    st.markdown(
+        "- **Dataset**: carichi CSV (robusto, gestisce righe malformate)\n"
+        "- **Ricerca**: incolli URL da scrappare e scegli categoria/stato/fase/date\n"
+        "- Indicatore: mostra sempre che sta lavorando + ETA stimata\n"
+    )
 
 
-# -----------------------------
-# Pages
-# -----------------------------
 def page_dataset():
-    st.subheader("📂 Dataset Portali")
-    st.write("Carica un CSV con almeno una colonna URL (ALBO_PRETORIO_URL oppure URL).")
+    st.header("📁 Dataset")
+    st.write("Carica un CSV (file o URL). Parsing robusto: `sep auto` + `skip` righe malformate.")
 
-    uploaded = st.file_uploader("Carica CSV portali", type=["csv"])
-    if uploaded:
-        df, w1 = _safe_read_csv(uploaded)
-        for w in w1:
-            st.warning(w)
-        if df is None:
-            st.error("Impossibile leggere il CSV.")
-            return
-
-        df, w2 = normalize_targets_df(df)
-        for w in w2:
-            st.warning(w)
-
-        st.session_state["targets_df"] = df
-        st.success(f"Dataset caricato: {len(df)} portali validi")
-        st.dataframe(df.head(30), use_container_width=True)
-
-    st.markdown("### ➕ Aggiungi URL custom")
-    colA, colB = st.columns([3, 1])
+    colA, colB = st.columns([1, 1])
     with colA:
-        custom_url = st.text_input("URL portale / albo da scrappare", placeholder="https://... oppure dominio.it/...")
+        up = st.file_uploader("Upload CSV", type=["csv"])
     with colB:
-        add_btn = st.button("Aggiungi", use_container_width=True)
+        url = st.text_input("...oppure URL CSV", value="")
 
-    if add_btn:
-        df = st.session_state.get("targets_df")
-        if df is None:
-            df = pd.DataFrame(columns=["COMUNE", "PROVINCIA", "REGIONE", "ALBO_PRETORIO_URL"])
-        df = add_custom_url(df, custom_url)
-        st.session_state["targets_df"] = df
-        st.success("URL aggiunto (se non duplicato).")
-        st.dataframe(df.tail(10), use_container_width=True)
+    df = None
+    warnings: List[str] = []
 
+    if up is not None:
+        raw = up.read()
+        df, warnings = load_csv_robust_from_bytes(raw)
+    elif url.strip():
+        df, warnings = load_csv_robust(url.strip())
 
-def page_settings():
-    st.subheader("⚙️ Impostazioni / Feature toggle")
+    for w in warnings:
+        st.warning(w)
 
-    st.markdown("### Modalità avanzate (attivale solo quando ti servono)")
-    st.session_state["enable_selenium_mode"] = st.checkbox(
-        "Abilita Modalità Selenium (headless chromium)",
-        value=st.session_state.get("enable_selenium_mode", False),
-        help="Più potente su siti con JS, ma più lenta/pesante."
-    )
-    st.session_state["enable_pdf_parsing"] = st.checkbox(
-        "Abilita Parsing PDF (pypdf)",
-        value=st.session_state.get("enable_pdf_parsing", False),
-        help="Scarica PDF e cerca testo + data nel documento. Più lento ma permette filtri data veri."
-    )
-
-    st.info(
-        "Consiglio Cloud: lascia OFF Selenium e PDF parsing per test rapidi.\n"
-        "Poi abilitali quando devi filtrare davvero per data/categoria."
-    )
-
-
-def page_search():
-    st.subheader("🕷️ Ricerca")
-    df = st.session_state.get("targets_df")
-    if df is None or len(df) == 0:
-        st.warning("Prima carica un dataset nella sezione 📂 Dataset.")
+    if df is None or df.empty:
+        st.info("Nessun dataset caricato.")
+        st.session_state.pop("dataset_df", None)
+        st.session_state.pop("dataset_url_col", None)
         return
 
-    enable_selenium = bool(st.session_state.get("enable_selenium_mode"))
-    enable_pdf = bool(st.session_state.get("enable_pdf_parsing"))
+    st.session_state["dataset_df"] = df
+    st.success(f"Dataset caricato: {df.shape[0]} righe, {df.shape[1]} colonne")
+    st.dataframe(df, use_container_width=True)
 
-    # Filters
-    st.markdown("### 🔽 Filtri progetto")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        category = st.selectbox("Categoria progetto", CATEGORIES, index=0)
-    with c2:
-        stato = st.selectbox("Stato progetto", STATI, index=0)
-    with c3:
-        fase = st.selectbox("Fase", FASI, index=0)
+    url_cols = [c for c in df.columns if "url" in str(c).lower() or "link" in str(c).lower()]
+    st.markdown("### Colonna URL (opzionale)")
+    if url_cols:
+        col = st.selectbox("Seleziona colonna URL", url_cols)
+        st.session_state["dataset_url_col"] = col
+        st.caption("In Ricerca potrai includere gli URL di questa colonna.")
+    else:
+        st.caption("Non ho trovato colonne che sembrano contenere URL (nomi con 'url' o 'link').")
 
-    st.markdown("### 📅 Filtro date (basato su data estratta dal PDF quando disponibile)")
-    d1, d2, d3 = st.columns([1, 1, 1])
-    with d1:
-        date_start = st.date_input("Data inizio", value=None)
-    with d2:
-        date_end = st.date_input("Data fine", value=None)
-    with d3:
-        include_no_date = st.checkbox("Includi documenti senza data trovata", value=True)
 
-    # Params
-    with st.expander("⚙️ Parametri ricerca", expanded=True):
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            max_portals = st.number_input("Max portali", min_value=1, max_value=int(len(df)), value=min(30, int(len(df))))
-        with col2:
-            max_pages = st.number_input("Max pagine/portale (solo Light)", min_value=1, max_value=20, value=3, help="Con Selenium si usa solo la prima pagina.")
-        with col3:
-            max_pdf = st.number_input("Max PDF/portale", min_value=1, max_value=500, value=80)
-        with col4:
-            timeout = st.number_input("Timeout (sec)", min_value=5, max_value=60, value=20)
-        with col5:
-            pdf_max_mb = st.number_input(
-                "Max MB per PDF",
-                min_value=1,
-                max_value=50,
-                value=PDF_MAX_MB_DEFAULT,
-                help="Limite download per evitare PDF enormi."
-            )
+def page_search(state):
+    st.header("🧭 Ricerca")
 
-    st.markdown("### ▶️ Avvio")
-    colA, colB, colC = st.columns([1, 1, 2])
-    with colA:
-        start_btn = st.button("🚀 Avvia ricerca", type="primary", use_container_width=True)
-    with colB:
-        stop_btn = st.button("🛑 Stop", use_container_width=True)
+    st.markdown("### Sorgenti URL")
+    col1, col2 = st.columns([1, 1])
 
-    if stop_btn:
-        st.session_state["stop"] = True
-        st.warning("Stop richiesto: la ricerca si fermerà al prossimo step.")
-
-    # Live UI
-    progress = st.progress(0)
-    status = st.empty()
-    eta_box = st.empty()
-    last_box = st.empty()
-
-    def progress_cb(done, total, elapsed, remaining, last_pr: PortalResult):
-        progress.progress(done / total)
-        status.info(f"Processati {done}/{total} portali — elapsed {seconds_to_hhmmss(elapsed)}")
-        eta_box.success(f"⏳ ETA stimata: {seconds_to_hhmmss(remaining)} (countdown stimato)")
-        last_box.write(
-            f"Ultimo portale: **{last_pr.portal_url}**  | risultati: **{len(last_pr.items)}**"
-            + (f" | errore: `{last_pr.error}`" if last_pr.error else "")
+    with col1:
+        # ✅ richiesta: possibilità di inserire un URL da scrappare
+        urls_text = st.text_area(
+            "Incolla uno o più URL (uno per riga)",
+            value="",
+            height=120,
+            placeholder="https://www.comune.esempio.it/albo-pretorio\nhttps://www....",
+        )
+        extra_terms = st.text_area(
+            "Keyword extra (comma/righe)",
+            value="",
+            height=80,
+            placeholder='es: "affidamento progettazione", "incarico", CUP, CIG',
         )
 
-    def stop_flag_cb():
-        return bool(st.session_state.get("stop"))
+    with col2:
+        use_dataset = st.checkbox("Usa anche URL dal dataset caricato", value=False)
+        limit_urls = st.number_input("Max URL dal dataset", 1, 5000, 200, 50)
 
-    # Convert date inputs: Streamlit returns datetime.date or None
-    ds = date_start if isinstance(date_start, date) else None
-    de = date_end if isinstance(date_end, date) else None
+        dataset_info = "—"
+        if use_dataset and "dataset_df" in st.session_state:
+            df = st.session_state["dataset_df"]
+            col = st.session_state.get("dataset_url_col")
+            if col and col in df.columns:
+                dataset_info = f"{len(df[col].dropna().unique())} URL unici dalla colonna '{col}'"
+            else:
+                dataset_info = "Dataset caricato ma colonna URL non selezionata."
+        st.write(dataset_info)
 
-    if start_btn:
-        st.session_state["stop"] = False
-        targets = df.head(int(max_portals)).to_dict("records")
+    # Build URL list
+    urls: List[str] = []
+    if urls_text.strip():
+        for line in urls_text.splitlines():
+            u = normalize_url(line)
+            if u:
+                urls.append(u)
 
-        with st.spinner("Ricerca in corso… (progress/ETA sopra)"):
-            results = run_scrape(
-                targets=targets,
-                max_pages_per_portal=int(max_pages),
-                max_pdf_per_portal=int(max_pdf),
-                timeout=int(timeout),
-                use_selenium=enable_selenium,
-                parse_pdf=enable_pdf,
-                pdf_max_mb=int(pdf_max_mb),
-                date_start=ds,
-                date_end=de,
-                include_no_date=bool(include_no_date),
-                category=category,
-                stato=stato,
-                fase=fase,
-                progress_cb=progress_cb,
-                stop_flag_cb=stop_flag_cb,
-            )
+    if use_dataset and "dataset_df" in st.session_state:
+        df = st.session_state["dataset_df"]
+        col = st.session_state.get("dataset_url_col")
+        if col and col in df.columns:
+            from_ds = [normalize_url(x) for x in df[col].dropna().astype(str).tolist()]
+            from_ds = [x for x in from_ds if x]
+            seen = set(urls)
+            for u in from_ds:
+                if u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+            urls = urls[: int(limit_urls)]
+        else:
+            st.warning("Dataset attivo ma colonna URL non selezionata in Dataset.")
 
-        st.session_state["raw_results"] = results
-        st.success(f"Ricerca completata. Portali processati: {len(results)}")
-        st.rerun()
-
-
-def page_results():
-    st.subheader("📊 Risultati")
-    results = st.session_state.get("raw_results")
-    if not results:
-        st.info("Nessun risultato. Avvia una ricerca da 🕷️ Ricerca.")
+    if not urls:
+        st.info("Inserisci almeno 1 URL (o carica un dataset e seleziona la colonna URL).")
         return
 
-    # Flatten items
-    flat = []
-    for r in results:
-        base = {
-            "comune": r.get("comune"),
-            "provincia": r.get("provincia"),
-            "regione": r.get("regione"),
-            "portal_url": r.get("portal_url"),
-            "portal_error": r.get("error"),
+    terms = compile_terms(state["category"], extra_terms, state["status"], state["phase"])
+
+    st.markdown("### Parametri attivi")
+    st.write(
+        {
+            "urls": len(urls),
+            "categoria": state["category"],
+            "stato": state["status"],
+            "fase": state["phase"],
+            "terms (preview)": terms[:25],
+            "selenium": state["use_selenium"],
+            "parse_pdf": state["parse_pdf"],
+            "data_inizio": str(state["start_date"]) if state["start_date"] else None,
+            "data_fine": str(state["end_date"]) if state["end_date"] else None,
+            "depth": state["max_depth"],
         }
-        for it in (r.get("items") or []):
-            flat.append({
-                **base,
-                "pdf_url": it.get("pdf_url"),
-                "anchor_text": it.get("anchor_text"),
-                "context": it.get("context"),
-                "doc_date": it.get("doc_date"),
-                "pdf_error": it.get("pdf_error"),
-            })
+    )
 
-    df = pd.DataFrame(flat)
-    st.write(f"Record estratti: **{len(df)}**")
+    if not st.button("🚀 Avvia ricerca", type="primary"):
+        st.caption("Suggerimento: lascia Selenium e parsing PDF OFF finché non ti servono.")
+        return
 
-    if len(df) > 0:
-        # make dates readable
-        if "doc_date" in df.columns:
-            df["doc_date"] = df["doc_date"].astype(str).replace({"None": ""})
+    # ✅ soluzione A: indicator che sta lavorando + ETA
+    status_box = st.container()
+    results_all: List[SearchResult] = []
+    t0 = time.time()
+    total_urls = len(urls)
+    hard_max = int(state["max_results"])
 
-        st.dataframe(df, use_container_width=True, height=520)
+    for i, u in enumerate(urls, start=1):
+        elapsed = time.time() - t0
+        rate = i / elapsed if elapsed > 0 else 0.0
+        remaining_urls = total_urls - i
+        eta = (remaining_urls / rate) if rate > 0 else None
+        show_working_indicator(f"URL {i}/{total_urls}: {u}", i / max(total_urls, 1), eta)
 
-        st.markdown("### 📎 Esporta")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                "⬇️ Scarica risultati (CSV)",
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name="scrape_results_flat.csv",
-                mime="text/csv",
-                use_container_width=True
+        try:
+            chunk = crawl_url(
+                start_url=u,
+                terms=terms,
+                use_selenium=state["use_selenium"],
+                parse_pdf_toggle=state["parse_pdf"],
+                start_date=state["start_date"],
+                end_date=state["end_date"],
+                max_results=max(1, hard_max - len(results_all)),
+                max_depth=int(state["max_depth"]),
+                status_box=status_box,
             )
-        with col2:
-            # portal summary
-            summary = pd.DataFrame([{
-                "comune": r.get("comune"),
-                "provincia": r.get("provincia"),
-                "regione": r.get("regione"),
-                "portal_url": r.get("portal_url"),
-                "portal_error": r.get("error"),
-                "n_items": r.get("n_items"),
-            } for r in results])
-            st.download_button(
-                "⬇️ Scarica riepilogo portali (CSV)",
-                data=summary.to_csv(index=False).encode("utf-8"),
-                file_name="portals_summary.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+            results_all.extend(chunk)
+        except Exception as e:
+            results_all.append(SearchResult(u, u, "ERRORE", [], note=f"Errore ricerca: {e}"))
 
-        st.markdown("### 🔎 Preview link (prime 200)")
-        st.code("\n".join(df["pdf_url"].dropna().astype(str).tolist()[:200]) if len(df) else "—")
+        if len(results_all) >= hard_max:
+            break
+
+    st.success(f"Ricerca completata: {len(results_all)} risultati (limite {hard_max}).")
+
+    out_df = pd.DataFrame(
+        [
+            {
+                "SOURCE_URL": r.source_url,
+                "FOUND_URL": r.found_url,
+                "TITLE": r.title,
+                "MATCHED_TERMS": ", ".join(r.matched_terms),
+                "DOC_DATE": r.doc_date or "",
+                "EMAILS": ", ".join(r.emails or []),
+                "NOTE": r.note or "",
+            }
+            for r in results_all
+        ]
+    )
+
+    st.dataframe(out_df, use_container_width=True)
+    st.download_button(
+        "⬇️ Scarica risultati CSV",
+        out_df.to_csv(index=False).encode("utf-8"),
+        file_name="risultati_ricerca.csv",
+        mime="text/csv",
+    )
+
+
+def main():
+    state = sidebar_controls()
+    if state["nav"] == "Home":
+        page_home()
+    elif state["nav"] == "Dataset":
+        page_dataset()
     else:
-        st.warning("Nessun item trovato con i filtri correnti.")
+        page_search(state)
 
 
-# Router
-if page == "📂 Dataset":
-    page_dataset()
-elif page == "🕷️ Ricerca":
-    page_search()
-elif page == "📊 Risultati":
-    page_results()
-else:
-    page_settings()
+if __name__ == "__main__":
+    main()
