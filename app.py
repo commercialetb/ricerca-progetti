@@ -65,24 +65,29 @@ def page_dataset() -> None:
     if src == "Dal repo (DEFAULT)":
         st.code(default_path)
         if st.button("Carica CSV dal repo", type="primary"):
-            df, warnings = load_csv_robusto(default_path)
+            df, report = load_csv_robusto(default_path)
             st.session_state["portals_df"] = df
-            st.session_state["portals_warnings"] = warnings
+            st.session_state["portals_report"] = report
             st.success(f"Caricati {len(df):,} record dal CSV.")
 
     else:
         up = st.file_uploader("Carica CSV portali", type=["csv"], accept_multiple_files=False)
         if up is not None:
-            df, warnings = load_csv_robusto(up)
+            df, report = load_csv_robusto(up)
             st.session_state["portals_df"] = df
-            st.session_state["portals_warnings"] = warnings
+            st.session_state["portals_report"] = report
             st.success(f"Caricati {len(df):,} record dal CSV caricato.")
 
-    warnings = st.session_state.get("portals_warnings")
-    if warnings:
-        with st.expander("⚠️ Avvisi di parsing CSV"):
-            for w in warnings:
-                st.warning(w)
+    report = st.session_state.get("portals_report")
+    if report is not None:
+        with st.expander("ℹ️ Report caricamento CSV"):
+            st.write(f"**Sorgente:** {report.path}")
+            st.write(f"**Righe:** {report.rows:,}")
+            st.write(f"**Colonne:** {report.cols}")
+            st.write(f"**Delimitatore:** `{report.delimiter}`")
+            st.write(f"**Bad lines policy:** `{report.bad_lines_policy}`")
+            if getattr(report, "notes", ""):
+                st.info(report.notes)
 
     df = st.session_state.get("portals_df")
     if isinstance(df, pd.DataFrame):
